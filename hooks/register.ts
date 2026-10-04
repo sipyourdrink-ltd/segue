@@ -107,18 +107,18 @@ async function census($, command) {
 
 // Local day and time for the file name; UTC when the host has no `date`.
 async function stamp($) {
-  const local = (await run($, ["date", "+%Y-%m-%d %H%M %z"])).split(" ");
-  if (local.length === 3) return { day: local[0], hhmm: local[1], zone: local[2] };
+  const local = (await run($, ["date", "+%Y-%m-%d %H%M%S %z"])).split(" ");
+  if (local.length === 3) return { day: local[0], time: local[1], zone: local[2] };
   const iso = new Date(await $.clock.now()).toISOString();
-  return { day: iso.slice(0, 10), hhmm: iso.slice(11, 16).replace(":", ""), zone: "UTC" };
+  return { day: iso.slice(0, 10), time: iso.slice(11, 19).replace(/:/g, ""), zone: "UTC" };
 }
 
 async function saveHandoff($, dir, model, e, card) {
-  const { day, hhmm, zone } = await stamp($);
+  const { day, time, zone } = await stamp($);
   const id = await $.session.id();
-  const path = `${dir}/${day}-${hhmm}-${id.slice(0, 8)}.md`;
+  const path = `${dir}/${day}-${time}-${id.slice(0, 8)}.md`;
   const head =
-    `# Handoff before compaction — ${day} ${hhmm} ${zone} (session ${id.slice(0, 8)})\n` +
+    `# Handoff before compaction — ${day} ${time} ${zone} (session ${id.slice(0, 8)})\n` +
     `- trigger: ${e.trigger} · session: ${id} · cwd: ${await $.session.cwd()}\n` +
     `- written by ${model} from the transcript and a census of the machine: a hypothesis, not the truth\n` +
     `- resume: read this card → check it against the repository's actual state → carry on from "Next steps"\n\n`;
@@ -126,10 +126,11 @@ async function saveHandoff($, dir, model, e, card) {
   return path;
 }
 
-function pointer(path) {
+function pointer(path, censusCommand) {
   return "Before this compaction a handoff card was written to " + path + ". " +
     "Continue the work from it: read that file first, check it against the actual state " +
-    "(git status, running processes), then carry on from its \"Next steps\". " +
+    (censusCommand ? "(run `" + censusCommand + "`)" : "(git status, running processes)") +
+    ", then carry on from its \"Next steps\". " +
     "The card is a hypothesis; the machine is the truth.";
 }
 
@@ -144,15 +145,15 @@ export function register(on, options) {
       if (e.agentId) return await next(e);
       const transcript = render(e.messages);
       if (!transcript) return await next(e);
-      const extra = e.instructions ? `\nAlso: ${e.instructions}` : "";
+      const extra = e.instructions ? `\n\nThe user asked, for both blocks: ${e.instructions}` : "";
       const state = await census($, censusCommand);
       const r = await $.model.complete({
         model,
         system: SYSTEM,
         prompt: `<transcript>\n${transcript}\n</transcript>\n\n` +
           (state ? `<census>\n${state}\n</census>\n\n` : "") +
-          `In the <summary> block: ${SUMMARY_INSTRUCTION}${extra}\n\n` +
-          `In the <handoff> block: ${HANDOFF_INSTRUCTION}`,
+          `In the <summary> block: ${SUMMARY_INSTRUCTION}\n\n` +
+          `In the <handoff> block: ${HANDOFF_INSTRUCTION}${extra}`,
         maxTokens: 8000,
         timeoutMs: 180_000,
       });
@@ -171,19 +172,26 @@ export function register(on, options) {
       // A reply without either tag is read as the summary alone.
       const body = block(text, "summary") || (text.includes("<handoff>") ? "" : text.trim());
       if (body.length < MIN_SUMMARY_CHARS) {
-        $.ui.log(`segue: fallback to built-in (${r.isAnswered ? "short reply" : r.reason})`);
+        const why = r.isAnswered ? "short reply" : r.reason;
+        $.ui.log(`segue: fallback to built-in (${why})`);
+        if (e.trigger !== "precompute") {
+          $.ui.toast(`built-in summary used (${why})` + (handoffPath ? `; handoff card: ${handoffPath}` : ""));
+        }
         const res = await next(e);
         if (!handoffPath || !res.messages) return res;
-        return { ...res, messages: [...res.messages, { role: "user", text: pointer(handoffPath), toolUses: [] }] };
+        return { ...res, messages: [...res.messages, { role: "user", text: pointer(handoffPath, censusCommand), toolUses: [] }] };
       }
       const u = r.usage;
       $.ui.log(`segue: ${e.trigger} by ${model}, in ${u.input_tokens} out ${u.output_tokens}` +
         (handoffPath ? `, handoff ${handoffPath}` : ", no handoff"));
+      if (e.trigger !== "precompute") {
+        $.ui.toast(handoffPath ? `handoff card: ${handoffPath}` : "summary written, no handoff card");
+      }
       const summary = {
         role: "user",
         text: "This session is being continued from a previous conversation that ran out of context. " +
           "The summary below covers the earlier portion of the conversation.\n\nSummary:\n" + body +
-          (handoffPath ? "\n\n" + pointer(handoffPath) : ""),
+          (handoffPath ? "\n\n" + pointer(handoffPath, censusCommand) : ""),
         toolUses: [],
       };
       const kept = [summary];

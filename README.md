@@ -6,24 +6,25 @@
   <img alt="segue: a long conversation runs into a compaction; a handoff card is written before it and read after it, and the conversation continues from the card" src="https://raw.githubusercontent.com/sipyourdrink-ltd/segue/main/assets/segue-light.svg" width="820">
 </picture>
 
-### Claude Code compaction that continues without a break
+### Claude Code compaction that leaves a handoff card and continues from it
 
 [![tests](https://github.com/sipyourdrink-ltd/segue/actions/workflows/test.yml/badge.svg)](https://github.com/sipyourdrink-ltd/segue/actions/workflows/test.yml)
+[![release](https://img.shields.io/github/v/release/sipyourdrink-ltd/segue)](https://github.com/sipyourdrink-ltd/segue/releases)
 [![License](https://img.shields.io/github/license/sipyourdrink-ltd/segue)](LICENSE)
 
-[install](#install-in-a-minute) &middot; [what it costs](#what-it-costs) &middot; [what the agent reads](#what-the-agent-reads-afterwards) &middot; [options](#options) &middot; [limits](#limits)
+[install](#install) &middot; [what it costs](#what-it-costs) &middot; [what the agent reads](#what-the-agent-reads-afterwards) &middot; [options](#options) &middot; [limits](#limits)
 
 </div>
 
 ---
 
-> **Status: experimental.** segue uses Claude Code's function hooks, an interface that is switched on by an environment variable and may change between releases. When the hook is not loaded, compaction is the built-in one: nothing breaks, you only lose what segue adds.
+> **Status: experimental.** segue uses Claude Code's function hooks, an interface that is switched on by an environment variable and may change between releases. When the hook is not loaded, compaction is the built-in one: nothing breaks, you only lose what segue adds. Needs Claude Code 2.1.278 or later; tested on 2.1.285 and 2.1.286.
 
 After a compaction the agent keeps a summary and loses the thread: which step it was on, what it had already tried, what you told it not to do. segue is a Claude Code plugin that hooks `/compact` and auto-compact and does three things in one pass:
 
 1. **Before** the conversation is replaced, it writes a **handoff card** to disk: what is done (with the commit or path that proves it), what is in flight, the next three steps, the traps.
 2. It writes the **summary on Haiku** instead of the session's model. The session's model is never switched.
-3. **After** the compaction, the conversation ends with the card's path and one instruction: read it, check it against the repository, carry on from "Next steps".
+3. **After** the compaction, the conversation carries the card's path and one instruction: read it, check it against the repository, carry on from "Next steps".
 
 ### at a glance
 
@@ -31,6 +32,49 @@ After a compaction the agent keeps a summary and loses the thread: which step it
 - **About a cent per compaction.** One call to a small model over a transcript with tool output clipped. Numbers below.
 - **Fails open.** A refused call, an API error, a short reply, a thrown error: the built-in summary runs as if segue were not there.
 - **Small enough to read.** One file, about 200 lines, no network calls, no dependencies. [`hooks/register.ts`](hooks/register.ts).
+
+### install
+
+Two commands and one setting.
+
+```bash
+claude plugin marketplace add sipyourdrink-ltd/segue
+```
+
+```bash
+claude plugin install segue@sipyourdrink
+```
+
+Then switch function hooks on: add one key to `env` in `~/.claude/settings.json`. It applies to the CLI and the desktop app alike.
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1"
+  }
+}
+```
+
+Start a new session. After the next `/compact` or auto-compact a toast says `handoff card: <path>`, and the card is in `~/.claude/handoffs/`. If the model call failed, the toast says `built-in summary used` and why.
+
+<details>
+<summary>Try it without installing, or run it from a clone</summary>
+
+```bash
+git clone https://github.com/sipyourdrink-ltd/segue
+```
+
+```bash
+CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir ./segue
+```
+
+To keep a clone loaded in every session, set `CLAUDE_CODE_PLUGIN_DIRS` in the same `env` block to the clone's absolute path. The variable is a colon-separated list: if it already has a value, append to it instead of replacing it.
+
+The first load writes type files into the clone (`.claude-plugin/types/`, `tsconfig.json`). They are ignored by git.
+
+</details>
+
+Update: `claude plugin marketplace update sipyourdrink`, then `claude plugin update segue@sipyourdrink`; or `git pull` in a clone. Remove: `claude plugin uninstall segue@sipyourdrink`. Sessions already running keep the compaction they started with.
 
 ### what it costs
 
@@ -48,22 +92,23 @@ The smaller context afterwards matters more than the call itself: every later tu
 
 ### what the agent reads afterwards
 
-The compacted conversation is the summary, followed by this:
+The compacted conversation is the summary, followed by this (and then your last message, if you had just sent one):
 
 ```text
 Before this compaction a handoff card was written to
-~/.claude/handoffs/2026-10-04-1612-3f9c2a1b.md. Continue the work from it:
-read that file first, check it against the actual state (git status, running
-processes), then carry on from its "Next steps". The card is a hypothesis;
-the machine is the truth.
+/Users/you/.claude/handoffs/2026-10-04-161207-3f9c2a1b.md. Continue the work
+from it: read that file first, check it against the actual state (git status,
+running processes), then carry on from its "Next steps". The card is a
+hypothesis; the machine is the truth.
 ```
 
 And the card it points to looks like this (an illustrative example, not a recording):
 
 ```markdown
-# Handoff before compaction — 2026-10-04 1612 +0300 (session 3f9c2a1b)
-- trigger: auto · session: 3f9c2a1b-… · cwd: ~/work/billing
+# Handoff before compaction — 2026-10-04 161207 +0300 (session 3f9c2a1b)
+- trigger: auto · session: 3f9c2a1b-… · cwd: /Users/you/work/billing
 - written by haiku from the transcript and a census of the machine: a hypothesis, not the truth
+- resume: read this card → check it against the repository's actual state → carry on from "Next steps"
 
 ## Goal and repo
 - move invoice rounding from floats to integer cents · ~/work/billing · branch fix/rounding
@@ -94,36 +139,21 @@ And the card it points to looks like this (an illustrative example, not a record
 
 A line under **Done** carries a ✅ only when the transcript holds the artefact for it. Everything else is marked unconfirmed, so the agent re-checks instead of trusting.
 
-### install in a minute
+### options
 
-```bash
-git clone https://github.com/sipyourdrink-ltd/segue ~/.claude/segue
-```
-
-Try it for one session:
-
-```bash
-CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir ~/.claude/segue
-```
-
-Keep it for every new session, CLI and desktop: add two keys to `env` in `~/.claude/settings.json` (use the absolute path).
+Three, all optional. Set them with `/plugin configure segue@sipyourdrink`, or in your user `settings.json` (project settings are not read for plugin options):
 
 ```json
 {
-  "env": {
-    "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1",
-    "CLAUDE_CODE_PLUGIN_DIRS": "/Users/you/.claude/segue"
+  "pluginConfigs": {
+    "segue@sipyourdrink": {
+      "options": { "handoffDir": "~/notes/handoffs" }
+    }
   }
 }
 ```
 
-Check that it works: run `/compact` in a conversation with some history, then look in `~/.claude/handoffs/`. With `claude --debug` the log has a line like `segue: manual by haiku, in 7512 out 1480, handoff /Users/you/.claude/handoffs/…md`.
-
-Remove it: delete the two keys. Sessions already running keep the compaction they started with.
-
-### options
-
-Set them in `/config`, or under `pluginConfigs.segue.options` in `settings.json`.
+For a clone loaded with `--plugin-dir` or `CLAUDE_CODE_PLUGIN_DIRS` the key is `segue`.
 
 | option | default | what it does |
 |---|---|---|
@@ -131,9 +161,9 @@ Set them in `/config`, or under `pluginConfigs.segue.options` in `settings.json`
 | `handoffDir` | `~/.claude/handoffs` | where the cards go; one file per compaction, `<date>-<time>-<session>.md` |
 | `censusCommand` | empty | a shell command whose output is given to the model as the machine's state; empty means the built-in git census |
 
-The built-in census is `git status --branch`, `git worktree list`, the last five commits and the stash list, read at the moment of compaction. It is what lets the card say "3 uncommitted files on `fix/rounding`" from the machine instead of from memory. Outside a git repository there is no census and the card rests on the transcript alone.
+The built-in census is `git status --branch`, `git worktree list`, the last five commits and the stash list, read at the moment of compaction. It is what lets the card say "3 uncommitted files on `fix/rounding`" from the machine instead of from memory. Outside a git repository there is no census and the card rests on the transcript alone. With a `censusCommand`, the instruction after compaction tells the agent to run that same command when it checks the card.
 
-Text you pass to `/compact <instructions>` reaches the summary model as it does today.
+Text you pass to `/compact <instructions>` reaches the model for both the summary and the card.
 
 ### how it works
 
@@ -143,7 +173,8 @@ Text you pass to `/compact <instructions>` reaches the summary model as it does 
    ├─ census            git state, or your censusCommand
    ├─ one model call    transcript (tool I/O clipped) + census  →  <summary> + <handoff>
    ├─ write the card    <handoffDir>/<date>-<time>-<session>.md
-   └─ replace history   summary + "continue from <card>"  (+ your last message, verbatim)
+   ├─ replace history   summary + "continue from <card>"  (+ your last message, verbatim)
+   └─ toast             handoff card: <path>
 ```
 
 | if | then |
@@ -153,21 +184,28 @@ Text you pass to `/compact <instructions>` reaches the summary model as it does 
 | the card cannot be written | the summary stands without the pointer |
 | a subagent compacts its own transcript | segue stays out of it |
 
-Each row is a test in [`hooks/register.test.ts`](hooks/register.test.ts), run against the engine itself:
+Each row is a test in [`hooks/register.test.ts`](hooks/register.test.ts), run against the engine itself. From a clone:
 
 ```bash
-claude plugin validate . && claude plugin test .
+cd segue && claude plugin validate .claude-plugin/plugin.json && claude plugin test .
 ```
 
-`validate` also lists every engine call the module makes: one environment read (`HOME`), file writes, the model call, a clock read, and child processes (in the source these are `git`, `date` and your census command). There is no network call among them.
+Neither command needs a login. `validate` also lists every engine call the module makes: one environment read (`HOME`), the session's id and working directory, a clock read, file writes, the model call, child processes (in the source: `git`, `date`, and `sh` for your census command), a log line and a toast. There is no network call among them.
+
+CI installs the latest Claude Code on every run, so a red badge means the interface moved, not that your install broke: yours falls back to the built-in compaction.
 
 ### limits
 
-- **The interface is experimental.** A Claude Code update can change it. The failure mode is the built-in compaction, and the debug log says so.
+- **The interface is experimental.** A Claude Code update can change it. The failure mode is the built-in compaction, and the toast or the debug log says so.
 - **The card is written by a small model.** It is told to cite an artefact for every "done" and to mark the rest unconfirmed, and the agent is told to check the card against the repository. It is still a hypothesis.
 - **The summary is short on purpose** (up to 15 sentences). Detail belongs in the card and in the files it points to.
-- **The transcript goes to the summary model** through Claude Code's own model access, the same account as the session. Nothing is sent anywhere else.
-- **Tested on macOS with Claude Code 2.1.286.** Linux should behave the same. Without `date` and `sh` on the path, file names fall back to UTC and a custom census command does not run.
+- **Very long transcripts are trimmed.** Tool output is clipped, and above about 420k characters the middle of the conversation is left out of the model call; the beginning and the recent part stay.
+- **Cards are plain files and are never deleted.** A card can contain whatever the conversation contained. Keep `handoffDir` out of anything you share, and clear it when you like.
+- **One compaction plugin at a time.** If another plugin also answers `session.compact`, only one of them writes the summary.
+- **The transcript goes to the summary model** through Claude Code's own model access. segue makes no network call of its own.
+- **Tested on macOS; CI runs the tests on Linux.** Without `date` and `sh` on the path, file names fall back to UTC and a custom census command does not run.
+
+Something off? [Open an issue](https://github.com/sipyourdrink-ltd/segue/issues) with the toast text or the `segue:` line from `claude --debug`.
 
 ### why the name?
 
