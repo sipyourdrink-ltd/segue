@@ -1,6 +1,6 @@
 {
   "name": "segue",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Compaction that continues without a break: writes a handoff card before /compact and auto-compact, summarises on Haiku, and tells the agent to carry on from the card. Falls back to the built-in summary on any failure.",
   "author": {
     "name": "Sip Your Drink Ltd",
@@ -35,6 +35,18 @@
       "title": "Census command",
       "description": "Shell command whose output is given to the summary model as the machine's state. Empty: the built-in git census (branch, uncommitted files, worktrees, recent commits, stashes).",
       "default": ""
+    },
+    "holdForAgentsMinutes": {
+      "type": "number",
+      "title": "Hold automatic compaction for running subagents (minutes)",
+      "description": "While subagents started by the conversation are still running, an automatic compaction is held back for up to this long, so their answers arrive before the summary is written. Held only while the context is under 96%. 0: never hold.",
+      "default": 10
+    },
+    "agentGuardPercent": {
+      "type": "number",
+      "title": "Refuse new subagents from this context fill (%)",
+      "description": "An Agent call from the conversation is refused at or above this percentage of the context, with a reason that says to compact or hand off first. 0: off.",
+      "default": 90
     }
   }
 }

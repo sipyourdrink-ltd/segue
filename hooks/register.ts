@@ -17,6 +17,8 @@ const TOOL_INPUT_CHARS = 500;
 const TOOL_TEXT_CHARS = 1500;
 const CENSUS_CHARS = 8000;
 const AGENT_PROMPT_CHARS = 6000;
+// Past this fill an automatic compaction is no longer held for running subagents.
+const HOLD_CEILING_PERCENT = 96;
 const MIN_SUMMARY_CHARS = 200;
 const MIN_HANDOFF_CHARS = 200;
 
@@ -171,10 +173,42 @@ function pointer(path, censusCommand, agents) {
       "check their output on disk and relaunch what is unfinished instead of waiting." : "");
 }
 
+// The context's fill as the status line has it; unknown when the engine does not say.
+async function contextPercent($) {
+  try {
+    const u = await $.session.usage();
+    return u && u.context && typeof u.context.percent === "number" ? u.context.percent : undefined;
+  } catch (_) {
+    return undefined;
+  }
+}
+
+function number(v, fallback) {
+  const n = Number(v);
+  return v === undefined || v === null || v === "" || Number.isNaN(n) ? fallback : Math.max(0, n);
+}
+
 export function register(on, options) {
   const model = String((options && options.model) || "haiku");
   const censusCommand = String((options && options.censusCommand) || "");
   const handoffDir = String((options && options.handoffDir) || "~/.claude/handoffs");
+  const holdMs = number(options && options.holdForAgentsMinutes, 10) * 60_000;
+  const guardPercent = number(options && options.agentGuardPercent, 90);
+  // An automatic compaction being held back for running subagents: when the hold began.
+  let hold = null;
+
+  // A subagent started this close to the limit would be stopped by the next
+  // compaction before it answers. Refused with the way out, so the model
+  // compacts or hands off first and starts it after.
+  on("tool.call", async ($, e, next) => {
+    if (e.tool !== "Agent" || e.agentId || !guardPercent) return await next(e);
+    const percent = await contextPercent($);
+    if (percent === undefined || percent < guardPercent) return await next(e);
+    return {
+      deny: `segue: the context is at ${percent}% (guard at ${guardPercent}%); a subagent started now would be lost at the next compaction. ` +
+        "Compact or hand off first, then start it.",
+    };
+  });
 
   on("session.compact", async ($, e, next) => {
     try {
@@ -182,11 +216,31 @@ export function register(on, options) {
       if (e.agentId) return await next(e);
       const transcript = render(e.messages);
       if (!transcript) return await next(e);
+      const agents = await inFlight($, e.messages);
+      // Subagents still running are stopped by a compaction. An automatic one
+      // is held back until they answer: the engine asks again before each
+      // request. Bounded by the context's fill and by time, so a hold cannot
+      // run the conversation into the limit itself.
+      if (e.trigger === "auto" && agents.length && holdMs) {
+        const now = await $.clock.now();
+        if (!hold) hold = { since: now, toasted: false };
+        const percent = await contextPercent($);
+        if (percent !== undefined && percent < HOLD_CEILING_PERCENT && now - hold.since < holdMs) {
+          const why = `${agents.length} subagent(s) still running, context ${percent}%`;
+          $.ui.log(`segue: compaction held (${why})`);
+          if (!hold.toasted) {
+            hold.toasted = true;
+            $.ui.toast(`compaction held: ${why}`);
+          }
+          return { skip: `segue: ${why}; compaction resumes when they answer` };
+        }
+      }
+      hold = null;
       // Custom instructions steer what both blocks keep; the card's sections are not theirs to change.
       const extra = e.instructions
         ? `\n\nThe user also asked: ${e.instructions}\nFollow it in the summary. In the card follow it for what to keep; the card's sections and line format stay as specified.`
         : "";
-      const [state, agents] = await Promise.all([census($, censusCommand), inFlight($, e.messages)]);
+      const state = await census($, censusCommand);
       const running = agentsSection(agents);
       const r = await $.model.complete({
         model,
@@ -228,7 +282,8 @@ export function register(on, options) {
       $.ui.log(`segue: ${e.trigger} by ${model}, in ${u.input_tokens} out ${u.output_tokens}` +
         (handoffPath ? `, handoff ${handoffPath}` : ", no handoff"));
       if (e.trigger !== "precompute") {
-        $.ui.toast(handoffPath ? `handoff card: ${handoffPath}` : "summary written, no handoff card");
+        $.ui.toast((handoffPath ? `handoff card: ${handoffPath}` : "summary written, no handoff card") +
+          (agents.length ? ` · ${agents.length} subagent(s) were running: prompts in the card` : ""));
       }
       const summary = {
         role: "user",

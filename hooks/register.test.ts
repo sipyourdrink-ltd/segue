@@ -13,13 +13,13 @@ const answered = text => ({ isAnswered: true, text, usage: { input_tokens: 10, o
 
 // The world beneath the plugin: what the model answers, what the machine says.
 // A call on `$` is answered with { value }; an event (session.compact) with its result.
-function world(on, reply, { git = true, disk = true } = {}) {
+function world(on, reply, { git = true, disk = true, now = () => 0 } = {}) {
   const seen = { writes: [], prompts: [], runs: [], toasts: [] };
   const ran = (exitCode, stdout) => ({ value: { exitCode, stdout, stderr: "", isStdoutTruncated: false, isStderrTruncated: false } });
   on("env.get", async () => ({ value: "/home/u" }));
   on("session.id", async () => ({ value: "0123456789abcdef" }));
   on("session.cwd", async () => ({ value: "/home/u/work" }));
-  on("clock.now", async () => ({ value: 0 }));
+  on("clock.now", async () => ({ value: now() }));
   on("ui.log", async () => ({ value: undefined }));
   on("ui.toast", async (_$, e) => { seen.toasts.push(e.text); return { value: undefined }; });
   on("process.run", async (_$, e) => {
@@ -177,4 +177,106 @@ test("without an agent listing, only calls still waiting for an answer count as 
   expect(seen.writes[0].text).toContain("List every caller of parse() in src/.");
   expect(seen.writes[0].text).not.toContain("Run the linter");
   expect(r.messages[0].text).toContain("1 subagent(s)");
+});
+
+// A conversation at a given fill, with one subagent of the main loop still running.
+function nearLimit(on, percent, { running = true } = {}) {
+  const state = { percent, running };
+  on("session.usage", async () => ({ value: { startedAt: 0, context: { window: 200_000, percent: state.percent } } }));
+  on("agent.list", async () => ({ value: [{ id: "a1", description: "Audit the parser", type: "Explore", status: state.running ? "running" : "completed" }] }));
+  return state;
+}
+
+test("an automatic compaction is held while a subagent runs and the context has room", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  nearLimit(on, 91);
+  const r = await $.session.compact({ trigger: "auto", messages: AGENT_MESSAGES });
+
+  expect(r.skip).toContain("1 subagent(s) still running");
+  expect(seen.prompts.length).toBe(0);
+  expect(seen.writes.length).toBe(0);
+  expect(seen.toasts).toEqual(["compaction held: 1 subagent(s) still running, context 91%"]);
+
+  // Asked again while it still runs: held again, no second toast.
+  const again = await $.session.compact({ trigger: "auto", messages: AGENT_MESSAGES });
+  expect(again.skip).toContain("still running");
+  expect(seen.toasts.length).toBe(1);
+});
+
+test("the hold ends when the context nears the limit: the compaction runs with the prompts in the card", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  nearLimit(on, 97);
+  const r = await $.session.compact({ trigger: "auto", messages: AGENT_MESSAGES });
+
+  expect(r.skip).toBeUndefined();
+  expect(seen.writes[0].text).toContain("## Subagents running at compaction");
+  expect(r.messages[0].text).toContain("1 subagent(s) were running at compaction");
+});
+
+test("the hold ends when the subagents have answered", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  nearLimit(on, 91, { running: false });
+  const r = await $.session.compact({ trigger: "auto", messages: AGENT_MESSAGES });
+
+  expect(r.skip).toBeUndefined();
+  expect(seen.writes[0].text).not.toContain("## Subagents running at compaction");
+  expect(r.messages[0].text).toContain(SUMMARY);
+});
+
+test("the hold is bounded in time", { options: { holdForAgentsMinutes: 0.001 } }, async ($, on) => {
+  let t = 0;
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`), { now: () => (t += 1000) });
+  nearLimit(on, 91);
+  const first = await $.session.compact({ trigger: "auto", messages: AGENT_MESSAGES });
+  expect(first.skip).toContain("still running");
+  // A second later the hold has run out: the compaction goes ahead, prompts in the card.
+  const r = await $.session.compact({ trigger: "auto", messages: AGENT_MESSAGES });
+
+  expect(r.skip).toBeUndefined();
+  expect(seen.writes[0].text).toContain("List every caller of parse() in src/.");
+});
+
+test("a hold of zero minutes never holds; an unknown fill is not held either", { options: { holdForAgentsMinutes: 0 } }, async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  nearLimit(on, 91);
+  const r = await $.session.compact({ trigger: "auto", messages: AGENT_MESSAGES });
+  expect(r.skip).toBeUndefined();
+  expect(seen.writes.length).toBe(1);
+});
+
+test("/compact typed by the person is not held; the toast says what was running", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  nearLimit(on, 91);
+  const r = await $.session.compact({ trigger: "manual", messages: AGENT_MESSAGES });
+
+  expect(r.skip).toBeUndefined();
+  expect(seen.toasts[0]).toContain("1 subagent(s) were running: prompts in the card");
+});
+
+test("a subagent is refused near the limit, with the way out; allowed with room, in a subagent's loop, or with the guard off", async ($, on) => {
+  on("tool.call", async () => ({ result: { agentId: "a9" }, text: "launched" }));
+  const fill = nearLimit(on, 92);
+  const input = { description: "Audit the parser", prompt: "List every caller of parse() in src/." };
+
+  const refused = await $.tool.call({ tool: "Agent", input });
+  expect(refused.deny).toContain("context is at 92% (guard at 90%)");
+  expect(refused.deny).toContain("Compact or hand off first");
+
+  const inner = await $.tool.call({ tool: "Agent", input, agentId: "a1" });
+  expect(inner.deny).toBeUndefined();
+
+  const other = await $.tool.call({ tool: "Read", input: { file_path: "/x" } });
+  expect(other.deny).toBeUndefined();
+
+  fill.percent = 40;
+  const allowed = await $.tool.call({ tool: "Agent", input });
+  expect(allowed.deny).toBeUndefined();
+  expect(allowed.text).toBe("launched");
+});
+
+test("the guard can be turned off", { options: { agentGuardPercent: 0 } }, async ($, on) => {
+  on("tool.call", async () => ({ result: { agentId: "a9" }, text: "launched" }));
+  nearLimit(on, 99);
+  const r = await $.tool.call({ tool: "Agent", input: { description: "x", prompt: "y" } });
+  expect(r.deny).toBeUndefined();
 });

@@ -31,7 +31,8 @@ After a compaction the agent keeps a summary and loses the thread: which step it
 - **A card on disk, not only a summary in context.** It survives the next compaction, a crash, and a move to another session.
 - **About a cent per compaction.** One call to a small model over a transcript with tool output clipped. Numbers below.
 - **Fails open.** A refused call, an API error, a short reply, a thrown error: the built-in summary runs as if segue were not there.
-- **Small enough to read.** One file, about 200 lines, no network calls, no dependencies. [`hooks/register.ts`](hooks/register.ts).
+- **Subagents are not lost to a compaction.** An automatic compaction waits for the ones still running, a new one is refused when the context is nearly full, and the prompts of any still running when the summary is written go into the card.
+- **Small enough to read.** One file, about 300 lines, no network calls, no dependencies. [`hooks/register.ts`](hooks/register.ts).
 
 ### install
 
@@ -160,6 +161,8 @@ For a clone loaded with `--plugin-dir` or `CLAUDE_CODE_PLUGIN_DIRS` the key is `
 | `model` | `haiku` | the model that writes the summary and the card |
 | `handoffDir` | `~/.claude/handoffs` | where the cards go; one file per compaction, `<date>-<time>-<session>.md` |
 | `censusCommand` | empty | a shell command whose output is given to the model as the machine's state; empty means the built-in git census |
+| `holdForAgentsMinutes` | `10` | how long an automatic compaction is held back while subagents of the conversation are still running; `0` never holds |
+| `agentGuardPercent` | `90` | from this fill of the context a new subagent is refused until the conversation compacts or hands off; `0` turns the guard off |
 
 The built-in census is `git status --branch`, `git worktree list`, the last five commits and the stash list, read at the moment of compaction. It is what lets the card say "3 uncommitted files on `fix/rounding`" from the machine instead of from memory. Outside a git repository there is no census and the card rests on the transcript alone. With a `censusCommand`, the instruction after compaction tells the agent to run that same command when it checks the card.
 
@@ -170,6 +173,7 @@ Text you pass to `/compact <instructions>` reaches the model for both the summar
 ```text
 /compact or auto-compact
    │
+   ├─ running subagents auto-compact with some still running → held, asked again later
    ├─ census            git state, or your censusCommand
    ├─ one model call    transcript (tool I/O clipped) + census  →  <summary> + <handoff>
    ├─ write the card    <handoffDir>/<date>-<time>-<session>.md
@@ -183,7 +187,9 @@ Text you pass to `/compact <instructions>` reaches the model for both the summar
 | the card is cut off by the output limit | it is written as far as it got |
 | the card cannot be written | the summary stands without the pointer |
 | a subagent compacts its own transcript | segue stays out of it |
-| subagents are still running when the conversation is compacted | their exact prompts go into the card, and the continued conversation is told to relaunch them rather than wait |
+| auto-compaction comes while subagents of the conversation are still running | it is held back (`{ skip }`): the engine asks again before each request, and the compaction runs once they have answered, with their answers in the transcript. The hold ends at 96% of the context or after `holdForAgentsMinutes`, whichever first |
+| subagents are still running when the compaction does run (`/compact`, the hold ran out) | their exact prompts go into the card, from the transcript, and the continued conversation is told to check their output on disk and relaunch the unfinished ones rather than wait |
+| the conversation starts a subagent at `agentGuardPercent` of the context or above | the call is refused with the reason: a subagent started now would be stopped by the next compaction; compact or hand off first |
 
 Each row is a test in [`hooks/register.test.ts`](hooks/register.test.ts), run against the engine itself. From a clone:
 
@@ -191,7 +197,7 @@ Each row is a test in [`hooks/register.test.ts`](hooks/register.test.ts), run ag
 cd segue && claude plugin validate .claude-plugin/plugin.json && claude plugin test .
 ```
 
-Neither command needs a login. `validate` also lists every engine call the module makes: one environment read (`HOME`), the session's id and working directory, a clock read, file writes, the model call, child processes (in the source: `git`, `date`, and `sh` for your census command), a log line and a toast. There is no network call among them.
+Neither command needs a login. `validate` also lists every engine call the module makes: one environment read (`HOME`), the session's id, working directory and context fill, the list of its agents, a clock read, file writes, the model call, child processes (in the source: `git`, `date`, and `sh` for your census command), a log line and a toast. There is no network call among them.
 
 CI installs the latest Claude Code on every run, so a red badge means the interface moved, not that your install broke: yours falls back to the built-in compaction.
 
