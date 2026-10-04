@@ -145,7 +145,10 @@ export function register(on, options) {
       if (e.agentId) return await next(e);
       const transcript = render(e.messages);
       if (!transcript) return await next(e);
-      const extra = e.instructions ? `\n\nThe user asked, for both blocks: ${e.instructions}` : "";
+      // Custom instructions steer what both blocks keep; the card's sections are not theirs to change.
+      const extra = e.instructions
+        ? `\n\nThe user also asked: ${e.instructions}\nFollow it in the summary. In the card follow it for what to keep; the card's sections and line format stay as specified.`
+        : "";
       const state = await census($, censusCommand);
       const r = await $.model.complete({
         model,

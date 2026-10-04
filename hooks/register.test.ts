@@ -95,7 +95,8 @@ test("a card that cannot be written leaves the summary without the pointer", asy
 test("text after /compact reaches the summary and the card", async ($, on) => {
   const seen = world(on, answered(`<summary>${SUMMARY}</summary><handoff>${CARD}</handoff>`));
   await $.session.compact({ trigger: "manual", instructions: "keep the SQL migrations", messages: MESSAGES });
-  expect(seen.prompts[0]).toContain("The user asked, for both blocks: keep the SQL migrations");
+  expect(seen.prompts[0]).toContain("The user also asked: keep the SQL migrations");
+  expect(seen.prompts[0]).toContain("the card's sections and line format stay as specified");
 });
 
 test("a reply without tags is read as the summary alone", async ($, on) => {

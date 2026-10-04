@@ -163,7 +163,7 @@ For a clone loaded with `--plugin-dir` or `CLAUDE_CODE_PLUGIN_DIRS` the key is `
 
 The built-in census is `git status --branch`, `git worktree list`, the last five commits and the stash list, read at the moment of compaction. It is what lets the card say "3 uncommitted files on `fix/rounding`" from the machine instead of from memory. Outside a git repository there is no census and the card rests on the transcript alone. With a `censusCommand`, the instruction after compaction tells the agent to run that same command when it checks the card.
 
-Text you pass to `/compact <instructions>` reaches the model for both the summary and the card.
+Text you pass to `/compact <instructions>` reaches the model for both the summary and the card. It decides what they keep; the card's sections stay as they are.
 
 ### how it works
 
