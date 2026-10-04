@@ -130,3 +130,51 @@ test("a subagent's compaction is not touched", async ($, on) => {
   expect(seen.writes.length).toBe(0);
   expect(r.messages[0].text).toBe("built-in summary");
 });
+
+const AGENT_MESSAGES = [
+  ...MESSAGES,
+  { role: "assistant", text: "Two agents in the background", toolUses: [
+    { tool_use_id: "toolu_1", tool: "Agent", agentId: "a1", input: { description: "Audit the parser", subagent_type: "Explore", prompt: "List every caller of parse() in src/." }, text: "launched" },
+    { tool_use_id: "toolu_2", tool: "Agent", agentId: "a2", input: { description: "Fix the lint", prompt: "Run the linter and fix src/a.ts." }, text: "launched" },
+  ] },
+];
+
+test("subagents still running at compaction land in the card with their exact prompts", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  on("agent.list", async () => ({ value: [
+    { id: "a1", description: "Audit the parser", type: "Explore", status: "running" },
+    { id: "a2", description: "Fix the lint", type: "general-purpose", status: "completed" },
+  ] }));
+  const r = await $.session.compact({ trigger: "auto", messages: AGENT_MESSAGES });
+
+  expect(seen.writes[0].text).toContain("## Next steps");
+  expect(seen.writes[0].text).toContain("## Subagents running at compaction");
+  expect(seen.writes[0].text).toContain("### 1. Audit the parser · Explore · id a1");
+  expect(seen.writes[0].text).toContain("List every caller of parse() in src/.");
+  expect(seen.writes[0].text).not.toContain("Run the linter");
+  expect(r.messages[0].text).toContain("1 subagent(s) were running at compaction");
+});
+
+test("the running subagents are saved even when the model writes no card", async ($, on) => {
+  const seen = world(on, { isAnswered: false, reason: "timeout" });
+  on("agent.list", async () => ({ value: [{ id: "a1", description: "Audit the parser", type: "Explore", status: "running" }] }));
+  const r = await $.session.compact({ trigger: "manual", messages: AGENT_MESSAGES });
+
+  expect(seen.writes.length).toBe(1);
+  expect(seen.writes[0].text).toContain("List every caller of parse() in src/.");
+  expect(r.messages[r.messages.length - 1].text).toContain("1 subagent(s) were running at compaction");
+});
+
+test("without an agent listing, only calls still waiting for an answer count as running", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  on("agent.list", async () => ({ deny: "not available" }));
+  const waiting = [...MESSAGES, { role: "assistant", text: "", toolUses: [
+    { tool_use_id: "toolu_3", tool: "Agent", input: { description: "Audit the parser", prompt: "List every caller of parse() in src/." } },
+    { tool_use_id: "toolu_4", tool: "Agent", input: { description: "Fix the lint", prompt: "Run the linter and fix src/a.ts." }, text: "done", result: {} },
+  ] }];
+  const r = await $.session.compact({ trigger: "auto", messages: waiting });
+
+  expect(seen.writes[0].text).toContain("List every caller of parse() in src/.");
+  expect(seen.writes[0].text).not.toContain("Run the linter");
+  expect(r.messages[0].text).toContain("1 subagent(s)");
+});

@@ -16,6 +16,7 @@ const HEAD_CHARS = 40_000;
 const TOOL_INPUT_CHARS = 500;
 const TOOL_TEXT_CHARS = 1500;
 const CENSUS_CHARS = 8000;
+const AGENT_PROMPT_CHARS = 6000;
 const MIN_SUMMARY_CHARS = 200;
 const MIN_HANDOFF_CHARS = 200;
 
@@ -77,6 +78,39 @@ function block(text, tag) {
   return m ? m[1].trim() : "";
 }
 
+// Subagents the main loop started that were still running at compaction. The
+// calls that would carry their results are summarised away, so the next turn
+// gets their prompts verbatim, from the transcript, not from the small model.
+async function inFlight($, messages) {
+  const calls = [];
+  for (const m of messages) {
+    for (const u of m.toolUses || []) {
+      if ((u.tool === "Agent" || u.tool === "Task") && u.input) calls.push(u);
+    }
+  }
+  if (!calls.length) return [];
+  let running = null;
+  try {
+    running = new Set((await $.agent.list()).filter(a => a.status === "running").map(a => a.id));
+  } catch (_) {
+    // No listing: a call still waiting for its answer is the best evidence left.
+  }
+  return calls.filter(u => running ? Boolean(u.agentId && running.has(u.agentId)) : !u.result && !u.text);
+}
+
+function agentsSection(calls) {
+  if (!calls.length) return "";
+  return "## Subagents running at compaction\n" +
+    "Their results may never reach this conversation. Check what they already wrote to disk, " +
+    "then relaunch the unfinished ones with these prompts; do not wait for them.\n\n" +
+    calls.map((u, i) => {
+      const x = u.input;
+      const meta = [x.subagent_type, x.model, u.agentId && `id ${u.agentId}`].filter(Boolean).join(" · ");
+      return `### ${i + 1}. ${x.description || "agent"}${meta ? " · " + meta : ""}\n` +
+        "```text\n" + clip(String(x.prompt || ""), AGENT_PROMPT_CHARS) + "\n```";
+    }).join("\n\n");
+}
+
 async function run($, argv) {
   try {
     const r = await $.process.run(argv, { timeoutMs: 20_000 });
@@ -126,12 +160,15 @@ async function saveHandoff($, dir, model, e, card) {
   return path;
 }
 
-function pointer(path, censusCommand) {
+function pointer(path, censusCommand, agents) {
   return "Before this compaction a handoff card was written to " + path + ". " +
     "Continue the work from it: read that file first, check it against the actual state " +
     (censusCommand ? "(run `" + censusCommand + "`)" : "(git status, running processes)") +
     ", then carry on from its \"Next steps\". " +
-    "The card is a hypothesis; the machine is the truth.";
+    "The card is a hypothesis; the machine is the truth." +
+    (agents ? ` ${agents} subagent(s) were running at compaction and may not report back: ` +
+      "the card's \"Subagents running at compaction\" has their exact prompts; " +
+      "check their output on disk and relaunch what is unfinished instead of waiting." : "");
 }
 
 export function register(on, options) {
@@ -149,7 +186,8 @@ export function register(on, options) {
       const extra = e.instructions
         ? `\n\nThe user also asked: ${e.instructions}\nFollow it in the summary. In the card follow it for what to keep; the card's sections and line format stay as specified.`
         : "";
-      const state = await census($, censusCommand);
+      const [state, agents] = await Promise.all([census($, censusCommand), inFlight($, e.messages)]);
+      const running = agentsSection(agents);
       const r = await $.model.complete({
         model,
         system: SYSTEM,
@@ -162,8 +200,10 @@ export function register(on, options) {
       });
       const text = r.isAnswered ? r.text : "";
       let handoffPath = "";
-      const card = block(text, "handoff");
-      if (card.length >= MIN_HANDOFF_CHARS) {
+      const written = block(text, "handoff");
+      // The running subagents are saved even when the small model wrote no card.
+      const card = [written.length >= MIN_HANDOFF_CHARS ? written : "", running].filter(Boolean).join("\n\n");
+      if (card) {
         try {
           const home = await $.env.get("HOME");
           const dir = handoffDir.startsWith("~/") && home ? home + handoffDir.slice(1) : handoffDir;
@@ -182,7 +222,7 @@ export function register(on, options) {
         }
         const res = await next(e);
         if (!handoffPath || !res.messages) return res;
-        return { ...res, messages: [...res.messages, { role: "user", text: pointer(handoffPath, censusCommand), toolUses: [] }] };
+        return { ...res, messages: [...res.messages, { role: "user", text: pointer(handoffPath, censusCommand, agents.length), toolUses: [] }] };
       }
       const u = r.usage;
       $.ui.log(`segue: ${e.trigger} by ${model}, in ${u.input_tokens} out ${u.output_tokens}` +
@@ -194,7 +234,7 @@ export function register(on, options) {
         role: "user",
         text: "This session is being continued from a previous conversation that ran out of context. " +
           "The summary below covers the earlier portion of the conversation.\n\nSummary:\n" + body +
-          (handoffPath ? "\n\n" + pointer(handoffPath, censusCommand) : ""),
+          (handoffPath ? "\n\n" + pointer(handoffPath, censusCommand, agents.length) : ""),
         toolUses: [],
       };
       const kept = [summary];

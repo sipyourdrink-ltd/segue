@@ -183,6 +183,7 @@ Text you pass to `/compact <instructions>` reaches the model for both the summar
 | the card is cut off by the output limit | it is written as far as it got |
 | the card cannot be written | the summary stands without the pointer |
 | a subagent compacts its own transcript | segue stays out of it |
+| subagents are still running when the conversation is compacted | their exact prompts go into the card, and the continued conversation is told to relaunch them rather than wait |
 
 Each row is a test in [`hooks/register.test.ts`](hooks/register.test.ts), run against the engine itself. From a clone:
 
