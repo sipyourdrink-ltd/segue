@@ -1,0 +1,30 @@
+{
+  "name": "segue",
+  "version": "0.1.0",
+  "description": "Compaction that continues without a break: writes a handoff card before /compact and auto-compact, summarises on Haiku, and tells the agent to carry on from the card. Falls back to the built-in summary on any failure.",
+  "author": { "name": "Sip Your Drink Ltd", "url": "https://github.com/sipyourdrink-ltd" },
+  "homepage": "https://github.com/sipyourdrink-ltd/segue",
+  "repository": "https://github.com/sipyourdrink-ltd/segue",
+  "license": "Apache-2.0",
+  "keywords": ["claude-code", "compaction", "compact", "handoff", "context", "hooks"],
+  "userConfig": {
+    "model": {
+      "type": "string",
+      "title": "Summary model",
+      "description": "Model that writes the summary and the handoff card. The session's own model is not changed.",
+      "default": "haiku"
+    },
+    "handoffDir": {
+      "type": "string",
+      "title": "Handoff folder",
+      "description": "Folder the handoff cards are written to. A leading ~/ is the home directory.",
+      "default": "~/.claude/handoffs"
+    },
+    "censusCommand": {
+      "type": "string",
+      "title": "Census command",
+      "description": "Shell command whose output is given to the summary model as the machine's state. Empty: the built-in git census (branch, uncommitted files, worktrees, recent commits, stashes).",
+      "default": ""
+    }
+  }
+}
