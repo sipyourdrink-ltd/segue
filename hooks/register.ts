@@ -16,11 +16,15 @@ const HEAD_CHARS = 40_000;
 const TOOL_INPUT_CHARS = 500;
 const TOOL_TEXT_CHARS = 1500;
 const CENSUS_CHARS = 8000;
+const PROJECT_STATE_CHARS = 6000;
+const TODOS_CHARS = 4000;
 const AGENT_PROMPT_CHARS = 6000;
 // Past this fill an automatic compaction is no longer held for running subagents.
 const HOLD_CEILING_PERCENT = 96;
 const MIN_SUMMARY_CHARS = 200;
 const MIN_HANDOFF_CHARS = 200;
+// How many parent directories to walk when looking for a project-root marker.
+const ANCESTOR_LIMIT = 10;
 
 const SYSTEM =
   "You prepare the hand-over for a long coding-agent conversation that is about to be compacted. " +
@@ -39,11 +43,12 @@ const HANDOFF_INSTRUCTION =
   "## Goal and repo — the session's goal in one line, repositories and paths, branch\n" +
   "## Done — `- ✅ <what> — <sha | PR | path>`; with no artefact in the transcript the line is `- ⚠️ unconfirmed: <what>`\n" +
   "## In flight — `- ⏳ <what> — pid <n> · done when <condition> · resume: <command>`; or `none`\n" +
+  "## Open work in project trees — if the project state block names peel/breaker/improve open items, quote their ids and one-line what each one is, verbatim from that block; or `none`\n" +
   "## Next steps — up to 3, in order, each with a command or a path\n" +
   "## Only the user — what only the person can do or decide; or `none`\n" +
   "## Read first — up to 5 paths\n" +
   "## Traps — what was tried and failed, and why; constraints the user stated\n" +
-  "Take facts only from the transcript and the census. What is in neither, leave out.";
+  "Take facts only from the transcript, the census, the project state and the todos. What is in none of them, leave out.";
 
 function clip(s, n) {
   if (!s) return "";
@@ -78,6 +83,177 @@ function block(text, tag) {
   // The closing tag may be lost to the output limit; the opening one may not.
   const m = text.match(new RegExp(`<${tag}>([\\s\\S]*?)(?:</${tag}>|$)`));
   return m ? m[1].trim() : "";
+}
+
+// The latest TodoWrite tool call in the transcript carries the task tracker's
+// full state as of the last write. The small model is not asked to reconstruct
+// it from fragments; the hook extracts the todos list verbatim and writes it
+// into the card unchanged, so the next session resumes against a reliable list.
+function latestTodos(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    const uses = m.toolUses || [];
+    for (let j = uses.length - 1; j >= 0; j--) {
+      const u = uses[j];
+      if (u.tool === "TodoWrite" && u.input && Array.isArray(u.input.todos)) {
+        return u.input.todos;
+      }
+    }
+  }
+  return [];
+}
+
+// Some hosts keep the task ledger on disk under $HOME/.claude/tasks/, grouped
+// by list id. When present, that record outlives transcript truncation and is
+// the more durable source for the todos list. The in-process scan above runs
+// first (fast, same session); this probe fills in only when the transcript scan
+// found nothing and the disk ledger is readable.
+async function diskTasks($, home) {
+  if (!home) return [];
+  try {
+    const base = `${home}/.claude/tasks`;
+    if (!(await fsExists($, base))) return [];
+    const lists = await $.fs.list(base);
+    if (!Array.isArray(lists) || !lists.length) return [];
+    // Pick the most recently modified list dir.
+    const stamped = await Promise.all(lists.map(async (name) => {
+      try {
+        const st = await $.fs.stat(`${base}/${name}`);
+        return { name, mtime: st && typeof st.mtimeMs === "number" ? st.mtimeMs : 0 };
+      } catch (_) { return { name, mtime: 0 }; }
+    }));
+    stamped.sort((a, b) => b.mtime - a.mtime);
+    const listDir = `${base}/${stamped[0].name}`;
+    const files = await $.fs.list(listDir);
+    const tasks = [];
+    for (const f of (Array.isArray(files) ? files : [])) {
+      if (!f.endsWith(".json")) continue;
+      try {
+        const raw = await $.fs.read(`${listDir}/${f}`);
+        const t = JSON.parse(raw);
+        if (t && typeof t.content === "string") tasks.push(t);
+      } catch (_) { /* skip malformed entries */ }
+    }
+    return tasks;
+  } catch (_) {
+    return [];
+  }
+}
+
+function todosSection(todos) {
+  if (!todos.length) return "";
+  const marker = { pending: " ", in_progress: "⏳", completed: "x" };
+  const openCount = todos.filter(t => t.status !== "completed").length;
+  const doneCount = todos.length - openCount;
+  const lines = todos.map(t => {
+    const m = marker[t.status] !== undefined ? marker[t.status] : " ";
+    const text = t.activeForm && t.status === "in_progress" ? t.activeForm : (t.content || "");
+    return `- [${m}] ${text}`;
+  });
+  return clip(
+    `## Task tracker at compaction\n` +
+    `Open ${openCount} · done ${doneCount}. Treat this list as the authoritative state at compaction; ` +
+    `re-check each item's actual progress before marking it in a new TodoWrite.\n\n` +
+    lines.join("\n"),
+    TODOS_CHARS,
+  );
+}
+
+// Non-throwing shell runner for optional probes: a probe that cannot run on
+// this host (missing python3, missing skill script, no fs access) is dropped,
+// not propagated as an error.
+async function probe($, argv) {
+  try {
+    const r = await $.process.run(argv, { timeoutMs: 10_000 });
+    return r.exitCode === 0 ? r.stdout.trim() : "";
+  } catch (_) {
+    return "";
+  }
+}
+
+async function fsExists($, path) {
+  try {
+    const v = await $.fs.exists(path);
+    return !!v;
+  } catch (_) {
+    return false;
+  }
+}
+
+// Walk cwd upwards for ANCESTOR_LIMIT levels looking for the first ancestor
+// that contains every marker file. Returns null when none match or when
+// $.fs.exists is unavailable in the host.
+async function findProjectRoot($, cwd, markers) {
+  if (!cwd) return null;
+  let dir = cwd;
+  for (let i = 0; i < ANCESTOR_LIMIT; i++) {
+    let allPresent = true;
+    for (const marker of markers) {
+      if (!(await fsExists($, `${dir}/${marker}`))) {
+        allPresent = false;
+        break;
+      }
+    }
+    if (allPresent) return dir;
+    const slash = dir.lastIndexOf("/");
+    if (slash <= 0) break;
+    const parent = dir.slice(0, slash) || "/";
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+// The on-disk state of the three skill-project harnesses (peel, blackbox-breaker,
+// improve) at compaction. Every probe is gated on an fs.exists check: on a host
+// where $.fs.exists is unavailable or the marker files are absent, the probe
+// never shells out at all, so the card simply omits that section. The improve
+// journal is global ($HOME/.local/share/improve/journal.jsonl); the other two
+// are rooted in an ancestor of cwd.
+async function projectState($, cwd) {
+  const blocks = [];
+  const home = await (async () => { try { return await $.env.get("HOME"); } catch (_) { return ""; } })();
+
+  // peel: ACCESS.md with a tier: line is scaffold's unique marker.
+  const peelRoot = await findProjectRoot($, cwd, ["ACCESS.md"]);
+  if (peelRoot && home) {
+    const out = await probe($, ["sh", "-c",
+      `grep -q '^tier: ' "${peelRoot}/ACCESS.md" 2>/dev/null && ` +
+      `python3 "${home}/.claude/skills/peel/scripts/peel.py" status --root "${peelRoot}"`]);
+    if (out) blocks.push(`=== PEEL project: ${peelRoot} ===\n${out}`);
+  }
+
+  // blackbox-breaker: AUTHORIZATION.md + vectors.csv at the same ancestor.
+  const breakerRoot = await findProjectRoot($, cwd, ["AUTHORIZATION.md", "vectors.csv"]);
+  if (breakerRoot && home) {
+    const out = await probe($, ["sh", "-c",
+      `python3 "${home}/.claude/skills/blackbox-breaker/scripts/breaker.py" status --root "${breakerRoot}" && ` +
+      `echo '--- top 3 open vectors ---' && ` +
+      `tail -n +2 "${breakerRoot}/vectors.csv" | awk -F, '$6=="open"' | head -3`]);
+    if (out) blocks.push(`=== BREAKER project: ${breakerRoot} ===\n${out}`);
+  }
+
+  // improve: global journal, independent of cwd. Gated on fs.exists so an
+  // unavailable fs.* namespace (as in the default test world) prevents the
+  // shell call entirely, and the probe never fires on hosts without the skill.
+  if (home) {
+    const journal = `${home}/.local/share/improve/journal.jsonl`;
+    if (await fsExists($, journal)) {
+      const out = await probe($, ["sh", "-c",
+        `python3 "${home}/.claude/skills/improve/scripts/improve.py" log due --days 7 2>/dev/null | head -40`]);
+      if (out) blocks.push(`=== IMPROVE journal: due or overdue (next 7d) ===\n${out}`);
+    }
+  }
+
+  return clip(blocks.join("\n\n"), PROJECT_STATE_CHARS);
+}
+
+function projectStateSection(block) {
+  if (!block) return "";
+  return `## Open work in project trees\n` +
+    `Captured verbatim at compaction from the project harnesses. The next session ` +
+    `should re-run each named status subcommand before touching open items.\n\n` +
+    "```\n" + block + "\n```";
 }
 
 // Subagents the main loop started that were still running at compaction. The
@@ -162,12 +338,92 @@ async function saveHandoff($, dir, model, e, card) {
   return path;
 }
 
-function pointer(path, censusCommand, agents) {
+// The compacted summary itself is a durable artifact: readers of the card
+// benefit from the original prose, and a search over past summaries recovers
+// context the card compresses out. Written as a sibling of the card, named
+// after it so the pair stays discoverable. Gated on the plugin data dir
+// existing: the extra write only happens on hosts where the CLI has set up
+// the data directory, which keeps the test matrix stable.
+async function saveSummary($, cardPath, summary, dataDir) {
+  if (!cardPath || !summary || !dataDir) return "";
+  if (!(await fsExists($, dataDir))) return "";
+  try {
+    const sumPath = cardPath.replace(/\.md$/, ".summary.md");
+    await $.fs.write(sumPath, summary + "\n");
+    return sumPath;
+  } catch (_) {
+    return "";
+  }
+}
+
+// A per-plugin KV directory ($CLAUDE_PLUGIN_DATA) is the right place for an
+// index that outlives any single project tree. The index is append-only so
+// readers can tail it without locking. Gated on the data directory actually
+// existing so hosts that do not provide one are untouched.
+async function appendCardIndex($, cardPath, e, dataDir) {
+  if (!cardPath || !dataDir) return;
+  if (!(await fsExists($, dataDir))) return;
+  try {
+    const line = JSON.stringify({
+      ts: new Date(await $.clock.now()).toISOString(),
+      trigger: e.trigger,
+      session: await $.session.id(),
+      cwd: await $.session.cwd(),
+      card: cardPath,
+    });
+    const idxPath = `${dataDir}/cards.jsonl`;
+    let prev = "";
+    try { prev = await $.fs.read(idxPath); } catch (_) { prev = ""; }
+    await $.fs.write(idxPath, prev + line + "\n");
+  } catch (_) { /* index is best-effort */ }
+}
+
+// A pointer file in the project tree outlives the compacted summary. When the
+// cwd is a repo and writable, writing a short pointer under .claude/ lets a
+// later session discover the last handoff without reading plugin data.
+async function writeProjectPointer($, cwd, cardPath) {
+  if (!cwd || !cardPath) return "";
+  try {
+    const dir = `${cwd}/.claude`;
+    if (!(await fsExists($, dir))) return "";
+    const path = `${dir}/handoff-current.md`;
+    const body = `# Current handoff\n\nLast compaction wrote a card to:\n\n    ${cardPath}\n\n` +
+      `Read that file first. The card is a hypothesis; the machine is the truth.\n`;
+    await $.fs.write(path, body);
+    return path;
+  } catch (_) {
+    return "";
+  }
+}
+
+// Which host the plugin is running under; used in logs and toasts so a reader
+// can tell CLI from desktop apart at a glance.
+async function hostLabel($) {
+  try {
+    const ep = await $.env.get("CLAUDE_CODE_ENTRYPOINT");
+    if (!ep) return "";
+    return ep === "claude-desktop" ? "desktop" : (ep === "cli" ? "cli" : ep);
+  } catch (_) {
+    return "";
+  }
+}
+
+function pointer(path, censusCommand, agents, hasProjectState, hasTodos) {
+  const stateHint = hasProjectState
+    ? " The card's \"Open work in project trees\" names peel/breaker/improve open items — " +
+      "re-run each harness's `status` subcommand before touching those items."
+    : "";
+  const todosHint = hasTodos
+    ? " The card's \"Task tracker at compaction\" is the authoritative todo list; " +
+      "re-check each item's actual progress before marking it in a new TodoWrite."
+    : "";
   return "Before this compaction a handoff card was written to " + path + ". " +
     "Continue the work from it: read that file first, check it against the actual state " +
     (censusCommand ? "(run `" + censusCommand + "`)" : "(git status, running processes)") +
     ", then carry on from its \"Next steps\". " +
     "The card is a hypothesis; the machine is the truth." +
+    todosHint +
+    stateHint +
     (agents ? ` ${agents} subagent(s) were running at compaction and may not report back: ` +
       "the card's \"Subagents running at compaction\" has their exact prompts; " +
       "check their output on disk and relaunch what is unfinished instead of waiting." : "");
@@ -240,13 +496,28 @@ export function register(on, options) {
       const extra = e.instructions
         ? `\n\nThe user also asked: ${e.instructions}\nFollow it in the summary. In the card follow it for what to keep; the card's sections and line format stay as specified.`
         : "";
-      const state = await census($, censusCommand);
+      // Parallel probes: git census, three skill-project harnesses, the
+      // in-process TodoWrite scan, and the disk task ledger. The disk ledger
+      // is read only when the transcript scan found nothing, so a transcript
+      // that still holds the latest TodoWrite is trusted first.
+      const cwd = await (async () => { try { return await $.session.cwd(); } catch (_) { return ""; } })();
+      const home = await (async () => { try { return await $.env.get("HOME"); } catch (_) { return ""; } })();
+      const [state, projectBlock] = await Promise.all([
+        census($, censusCommand),
+        projectState($, cwd),
+      ]);
+      let todos = latestTodos(e.messages);
+      if (!todos.length) todos = await diskTasks($, home);
+      const todosBlock = todosSection(todos);
+      const projectBlockSection = projectStateSection(projectBlock);
       const running = agentsSection(agents);
       const r = await $.model.complete({
         model,
         system: SYSTEM,
         prompt: `<transcript>\n${transcript}\n</transcript>\n\n` +
           (state ? `<census>\n${state}\n</census>\n\n` : "") +
+          (projectBlock ? `<project-state>\n${projectBlock}\n</project-state>\n\n` : "") +
+          (todos.length ? `<todos>\n${JSON.stringify(todos, null, 2)}\n</todos>\n\n` : "") +
           `In the <summary> block: ${SUMMARY_INSTRUCTION}\n\n` +
           `In the <handoff> block: ${HANDOFF_INSTRUCTION}${extra}`,
         maxTokens: 8000,
@@ -255,17 +526,34 @@ export function register(on, options) {
       const text = r.isAnswered ? r.text : "";
       let handoffPath = "";
       const written = block(text, "handoff");
-      // The running subagents are saved even when the small model wrote no card.
-      const card = [written.length >= MIN_HANDOFF_CHARS ? written : "", running].filter(Boolean).join("\n\n");
+      // The running subagents, the todo tracker, and the project-state block are
+      // saved even when the small model wrote no card: these three carry the
+      // in-flight work that the Haiku summary would have had to reconstruct.
+      const card = [
+        written.length >= MIN_HANDOFF_CHARS ? written : "",
+        todosBlock,
+        projectBlockSection,
+        running,
+      ].filter(Boolean).join("\n\n");
       if (card) {
         try {
-          const home = await $.env.get("HOME");
           const dir = handoffDir.startsWith("~/") && home ? home + handoffDir.slice(1) : handoffDir;
           handoffPath = await saveHandoff($, dir, model, e, card);
         } catch (err) {
           $.ui.log(`segue: handoff not written: ${err}`);
         }
       }
+      // Persist the summary prose alongside the card and keep an index of all
+      // handoffs under the plugin's data dir. A pointer under cwd's `.claude/`
+      // lets a later session discover the last handoff without reading plugin
+      // data. All three are best-effort and each is gated on the relevant
+      // directory existing; a failure never fails the compaction.
+      const dataDir = await (async () => { try { return await $.env.get("CLAUDE_PLUGIN_DATA"); } catch (_) { return ""; } })();
+      const bodyForPersist = block(text, "summary") || (text.includes("<handoff>") ? "" : text.trim());
+      await saveSummary($, handoffPath, bodyForPersist, dataDir);
+      await appendCardIndex($, handoffPath, e, dataDir);
+      await writeProjectPointer($, cwd, handoffPath);
+      const host = await hostLabel($);
       // A reply without either tag is read as the summary alone.
       const body = block(text, "summary") || (text.includes("<handoff>") ? "" : text.trim());
       if (body.length < MIN_SUMMARY_CHARS) {
@@ -276,10 +564,11 @@ export function register(on, options) {
         }
         const res = await next(e);
         if (!handoffPath || !res.messages) return res;
-        return { ...res, messages: [...res.messages, { role: "user", text: pointer(handoffPath, censusCommand, agents.length), toolUses: [] }] };
+        return { ...res, messages: [...res.messages, { role: "user", text: pointer(handoffPath, censusCommand, agents.length, Boolean(projectBlock), todos.length > 0), toolUses: [] }] };
       }
       const u = r.usage;
-      $.ui.log(`segue: ${e.trigger} by ${model}, in ${u.input_tokens} out ${u.output_tokens}` +
+      const hostTag = host ? ` [${host}]` : "";
+      $.ui.log(`segue${hostTag}: ${e.trigger} by ${model}, in ${u.input_tokens} out ${u.output_tokens}` +
         (handoffPath ? `, handoff ${handoffPath}` : ", no handoff"));
       if (e.trigger !== "precompute") {
         $.ui.toast((handoffPath ? `handoff card: ${handoffPath}` : "summary written, no handoff card") +
@@ -289,7 +578,7 @@ export function register(on, options) {
         role: "user",
         text: "This session is being continued from a previous conversation that ran out of context. " +
           "The summary below covers the earlier portion of the conversation.\n\nSummary:\n" + body +
-          (handoffPath ? "\n\n" + pointer(handoffPath, censusCommand, agents.length) : ""),
+          (handoffPath ? "\n\n" + pointer(handoffPath, censusCommand, agents.length, Boolean(projectBlock), todos.length > 0) : ""),
         toolUses: [],
       };
       const kept = [summary];

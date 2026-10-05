@@ -280,3 +280,145 @@ test("the guard can be turned off", { options: { agentGuardPercent: 0 } }, async
   const r = await $.tool.call({ tool: "Agent", input: { description: "x", prompt: "y" } });
   expect(r.deny).toBeUndefined();
 });
+
+const TODO_MESSAGES = [
+  ...MESSAGES,
+  { role: "assistant", text: "", toolUses: [
+    { tool_use_id: "toolu_t1", tool: "TodoWrite", input: { todos: [
+      { content: "Audit the parser", activeForm: "Auditing the parser", status: "completed" },
+      { content: "Fix the lint rule", activeForm: "Fixing the lint rule", status: "in_progress" },
+      { content: "Ship the release", activeForm: "Shipping the release", status: "pending" },
+    ] } },
+  ] },
+];
+
+test("the latest TodoWrite is captured verbatim in the card, with counts and markers", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  const r = await $.session.compact({ trigger: "auto", messages: TODO_MESSAGES });
+  expect(seen.writes[0].text).toContain("## Task tracker at compaction");
+  expect(seen.writes[0].text).toContain("Open 2 · done 1");
+  expect(seen.writes[0].text).toContain("- [x] Audit the parser");
+  expect(seen.writes[0].text).toContain("- [⏳] Fixing the lint rule");
+  expect(seen.writes[0].text).toContain("- [ ] Ship the release");
+  // The todos reach the summarizer too, as a block it must preserve.
+  expect(seen.prompts[0]).toContain("<todos>");
+  expect(seen.prompts[0]).toContain("Audit the parser");
+  // And the pointer tells the next session the tracker is authoritative.
+  expect(r.messages[0].text).toContain("Task tracker at compaction");
+});
+
+test("todos are still saved when the model's reply is unusable", async ($, on) => {
+  const seen = world(on, { isAnswered: false, reason: "timeout" });
+  const r = await $.session.compact({ trigger: "manual", messages: TODO_MESSAGES });
+  expect(seen.writes.length).toBe(1);
+  expect(seen.writes[0].text).toContain("## Task tracker at compaction");
+  expect(seen.writes[0].text).toContain("Ship the release");
+  // The pointer attached after the built-in summary still names the tracker.
+  expect(r.messages[r.messages.length - 1].text).toContain("Task tracker at compaction");
+});
+
+test("when $.fs.exists is unavailable, the project-state block is omitted and the prompt stays clean", async ($, on) => {
+  // The default world function registers no fs.exists handler, so every
+  // ancestor lookup returns false — projectState() must degrade to "".
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  const r = await $.session.compact({ trigger: "auto", messages: MESSAGES });
+  expect(seen.prompts[0]).not.toContain("<project-state>");
+  expect(seen.writes[0].text).not.toContain("## Open work in project trees");
+  expect(r.messages[0].text).not.toContain("Open work in project trees");
+  // The existing path keeps working: census + summary unchanged.
+  expect(seen.writes[0].text).toContain("## Next steps");
+});
+
+// A world where $.env.get returns distinct values per name and $.fs.exists is
+// stubbed by directory. Used to exercise the data-dir-gated writes.
+function worldWithEnv(on, reply, envMap, existsMap, extra = {}) {
+  const seen = { writes: [], reads: {}, toasts: [], logs: [] };
+  const ran = (exitCode, stdout) => ({ value: { exitCode, stdout, stderr: "", isStdoutTruncated: false, isStderrTruncated: false } });
+  on("env.get", async (_$, e) => ({ value: envMap[e.name] !== undefined ? envMap[e.name] : "" }));
+  on("session.id", async () => ({ value: "0123456789abcdef" }));
+  on("session.cwd", async () => ({ value: "/home/u/work" }));
+  on("clock.now", async () => ({ value: 0 }));
+  on("ui.log", async (_$, e) => { seen.logs.push(e.text); return { value: undefined }; });
+  on("ui.toast", async (_$, e) => { seen.toasts.push(e.text); return { value: undefined }; });
+  on("process.run", async (_$, e) => {
+    if (e.argv[0] === "date") return ran(0, "2026-10-04 161207 +0300\n");
+    return ran(0, "## main\n");
+  });
+  on("fs.exists", async (_$, e) => ({ value: Boolean(existsMap[e.path]) }));
+  if (extra.fsRead) on("fs.read", extra.fsRead);
+  else on("fs.read", async (_$, e) => {
+    if (seen.reads[e.path] === undefined) return { deny: "not found" };
+    return { value: seen.reads[e.path] };
+  });
+  if (extra.fsList) on("fs.list", extra.fsList);
+  if (extra.fsStat) on("fs.stat", extra.fsStat);
+  on("fs.write", async (_$, e) => {
+    seen.writes.push(e);
+    seen.reads[e.path] = e.text;
+    return { value: undefined };
+  });
+  on("model.complete", async () => ({ value: reply }));
+  on("session.compact", async () => ({ messages: [{ role: "user", text: "built-in summary", toolUses: [] }] }));
+  return seen;
+}
+
+test("the summary is persisted alongside the card and the card is indexed, when the plugin data dir exists", async ($, on) => {
+  const seen = worldWithEnv(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`),
+    { HOME: "/home/u", CLAUDE_PLUGIN_DATA: "/home/u/.local/share/segue", CLAUDE_CODE_ENTRYPOINT: "cli" },
+    { "/home/u/.local/share/segue": true });
+  await $.session.compact({ trigger: "auto", messages: MESSAGES });
+  const paths = seen.writes.map(w => w.path);
+  expect(paths).toContain("/home/u/.claude/handoffs/2026-10-04-161207-01234567.md");
+  expect(paths).toContain("/home/u/.claude/handoffs/2026-10-04-161207-01234567.summary.md");
+  expect(paths).toContain("/home/u/.local/share/segue/cards.jsonl");
+  const idx = seen.writes.find(w => w.path.endsWith("cards.jsonl"));
+  expect(idx.text).toContain("\"card\":\"/home/u/.claude/handoffs/2026-10-04-161207-01234567.md\"");
+  expect(idx.text).toContain("\"trigger\":\"auto\"");
+  // The log carries the host label when CLAUDE_CODE_ENTRYPOINT is set.
+  expect(seen.logs.some(l => l.includes("[cli]"))).toBe(true);
+});
+
+test("when the data dir does not exist, neither the summary file nor the index is written", async ($, on) => {
+  const seen = worldWithEnv(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`),
+    { HOME: "/home/u" }, {});
+  await $.session.compact({ trigger: "manual", messages: MESSAGES });
+  const paths = seen.writes.map(w => w.path);
+  // The card itself is still written to the default handoff dir.
+  expect(paths).toContain("/home/u/.claude/handoffs/2026-10-04-161207-01234567.md");
+  // But the summary sibling and the index are skipped.
+  expect(paths.some(p => p.endsWith(".summary.md"))).toBe(false);
+  expect(paths.some(p => p.endsWith("cards.jsonl"))).toBe(false);
+});
+
+test("a .claude/ pointer file is written when the cwd has one", async ($, on) => {
+  const seen = worldWithEnv(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`),
+    { HOME: "/home/u" }, { "/home/u/work/.claude": true });
+  await $.session.compact({ trigger: "auto", messages: MESSAGES });
+  const pointer = seen.writes.find(w => w.path === "/home/u/work/.claude/handoff-current.md");
+  expect(pointer).toBeDefined();
+  expect(pointer.text).toContain("2026-10-04-161207-01234567.md");
+  expect(pointer.text).toContain("Read that file first");
+});
+
+test("disk task ledger is read when the transcript carries no TodoWrite", async ($, on) => {
+  const seen = worldWithEnv(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`),
+    { HOME: "/home/u" }, { "/home/u/.claude/tasks": true },
+    {
+      fsList: async (_$, e) => {
+        if (e.path === "/home/u/.claude/tasks") return { value: ["list-1"] };
+        if (e.path === "/home/u/.claude/tasks/list-1") return { value: ["t1.json", "t2.json", "readme.txt"] };
+        return { value: [] };
+      },
+      fsStat: async (_$, e) => ({ value: { mtimeMs: e.path.endsWith("list-1") ? 1000 : 0 } }),
+      fsRead: async (_$, e) => {
+        if (e.path.endsWith("t1.json")) return { value: JSON.stringify({ content: "Ship v0.7.0", status: "in_progress", activeForm: "Shipping v0.7.0" }) };
+        if (e.path.endsWith("t2.json")) return { value: JSON.stringify({ content: "Write docs", status: "pending" }) };
+        return { deny: "not found" };
+      },
+    });
+  await $.session.compact({ trigger: "auto", messages: MESSAGES });
+  const card = seen.writes.find(w => w.path.endsWith("01234567.md"));
+  expect(card.text).toContain("## Task tracker at compaction");
+  expect(card.text).toContain("Shipping v0.7.0");
+  expect(card.text).toContain("Write docs");
+});
