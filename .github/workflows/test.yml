@@ -29,4 +29,4 @@ jobs:
           node-version: 22
       - run: node --check codex/segue.mjs
       - run: node -e 'for (const f of ["plugin.json", "codex/hooks.json", ".agents/plugins/marketplace.json"]) JSON.parse(require("fs").readFileSync(f, "utf8"))'
-      - run: node --test codex/
+      - run: node --test codex/segue.test.mjs
