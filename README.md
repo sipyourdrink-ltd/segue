@@ -6,13 +6,13 @@
   <img alt="segue: a long conversation runs into a compaction; a handoff card is written before it and read after it, and the conversation continues from the card" src="https://raw.githubusercontent.com/sipyourdrink-ltd/segue/main/assets/segue-light.svg" width="820">
 </picture>
 
-### Claude Code compaction that leaves a handoff card and continues from it
+### Compaction that leaves a handoff card and continues from it — for Claude Code and Codex
 
 [![tests](https://github.com/sipyourdrink-ltd/segue/actions/workflows/test.yml/badge.svg)](https://github.com/sipyourdrink-ltd/segue/actions/workflows/test.yml)
 [![release](https://img.shields.io/github/v/release/sipyourdrink-ltd/segue)](https://github.com/sipyourdrink-ltd/segue/releases)
 [![License](https://img.shields.io/github/license/sipyourdrink-ltd/segue)](LICENSE)
 
-[install](#install) &middot; [what it costs](#what-it-costs) &middot; [what the agent reads](#what-the-agent-reads-afterwards) &middot; [options](#options) &middot; [limits](#limits)
+[install](#install) &middot; [Codex](#codex-cli-and-the-chatgpt-desktop-app) &middot; [what it costs](#what-it-costs) &middot; [what the agent reads](#what-the-agent-reads-afterwards) &middot; [options](#options) &middot; [limits](#limits)
 
 </div>
 
@@ -32,7 +32,7 @@ After a compaction the agent keeps a summary and loses the thread: which step it
 - **About a cent per compaction.** One call to a small model over a transcript with tool output clipped. Numbers below.
 - **Fails open.** A refused call, an API error, a short reply, a thrown error: the built-in summary runs as if segue were not there.
 - **Subagents are not lost to a compaction.** An automatic compaction waits for the ones still running, a new one is refused when the context is nearly full, and the prompts of any still running when the summary is written go into the card.
-- **Small enough to read.** One file, about 300 lines, no network calls, no dependencies. [`hooks/register.ts`](hooks/register.ts).
+- **Small enough to read.** One file per host, about 300 lines each, no dependencies. [`hooks/register.ts`](hooks/register.ts) for Claude Code, [`codex/segue.mjs`](codex/segue.mjs) for Codex.
 
 ### install
 
@@ -76,6 +76,30 @@ The first load writes type files into the clone (`.claude-plugin/types/`, `tscon
 </details>
 
 Update: `claude plugin marketplace update sipyourdrink`, then `claude plugin update segue@sipyourdrink`; or `git pull` in a clone. Remove: `claude plugin uninstall segue@sipyourdrink`. Sessions already running keep the compaction they started with.
+
+### Codex CLI and the ChatGPT desktop app
+
+The same card, pointer, hold and guard run under Codex through its command hooks: [`codex/segue.mjs`](codex/segue.mjs), one Node script with no dependencies, wired by [`codex/hooks.json`](codex/hooks.json). What differs from Claude Code:
+
+| | Claude Code | Codex |
+|---|---|---|
+| handoff card before compaction | yes | yes, to `~/.codex/handoffs/` |
+| pointer to the card afterwards | in the summary | as developer context (`PostCompact`) |
+| hold an auto-compaction while subagents run | yes | yes (`continue: false`) |
+| refuse a new subagent near the limit | yes | yes (`PreToolUse` on `spawn_agent`) |
+| the summary itself | written on Haiku | Codex's own; a hook cannot replace it |
+| who writes the card | `$.model.complete` on Haiku | `codex exec --ephemeral` on the model you pick (`SEGUE_MODEL`, default: your Codex default) |
+| the context's fill | from the engine | estimated from the transcript's last `token_count` |
+
+Install from a clone (hooks from plugins run only after you trust them in `/hooks`):
+
+```bash
+git clone https://github.com/sipyourdrink-ltd/segue ~/.codex/segue-plugin
+```
+
+Then register the marketplace at `~/.agents/plugins/marketplace.json` (the repository's own [`.agents/plugins/marketplace.json`](.agents/plugins/marketplace.json) is a template: point `source.path` at the clone), run `/plugins` in Codex, enable `segue`, and trust its hooks in `/hooks`. Without plugins, paste the five entries of `codex/hooks.json` into `~/.codex/hooks.json` with `$PLUGIN_ROOT` replaced by the clone's path.
+
+Options are environment variables, read by the hook process: `SEGUE_MODEL`, `SEGUE_HANDOFF_DIR`, `SEGUE_CENSUS_COMMAND`, `SEGUE_HOLD_MINUTES`, `SEGUE_GUARD_PERCENT` — the same meaning as the Claude Code options below — and `SEGUE_TIMEOUT_SECONDS` (default 180) for the model call. Pick a fast model for `SEGUE_MODEL`: the call runs with low reasoning effort from an empty directory in a read-only sandbox, and the card is only as good as the model that writes it. When the call fails or times out, the compaction proceeds and a card with the running subagents is still written. State (running subagents, the last card's path) lives in the plugin's data directory, or `~/.codex/segue/` when the hooks are wired by hand.
 
 ### what it costs
 

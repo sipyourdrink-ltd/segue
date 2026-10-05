@@ -1,6 +1,6 @@
 {
   "name": "segue",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Compaction that continues without a break: writes a handoff card before /compact and auto-compact, summarises on Haiku, and tells the agent to carry on from the card. Falls back to the built-in summary on any failure.",
   "author": {
     "name": "Sip Your Drink Ltd",

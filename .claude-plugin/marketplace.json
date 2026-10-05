@@ -9,7 +9,7 @@
     {
       "name": "segue",
       "source": "./",
-      "description": "Compaction that continues without a break: a handoff card before /compact and auto-compact, the summary on Haiku, and an instruction to carry on from the card."
+      "description": "Compaction that continues without a break: a handoff card before /compact and auto-compact, the summary on Haiku, an instruction to carry on from the card; the same card under Codex CLI."
     }
   ]
 }

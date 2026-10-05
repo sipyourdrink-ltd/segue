@@ -1,0 +1,24 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "segue",
+  "version": "0.5.0",
+  "description": "Compaction that continues without a break: a handoff card written before the context is compacted, a pointer to it after, a hold while subagents still run, and a refusal of new subagents near the limit.",
+  "author": {
+    "name": "Sip Your Drink Ltd",
+    "url": "https://github.com/sipyourdrink-ltd"
+  },
+  "homepage": "https://github.com/sipyourdrink-ltd/segue",
+  "repository": "https://github.com/sipyourdrink-ltd/segue",
+  "license": "Apache-2.0",
+  "keywords": ["codex", "compaction", "compact", "handoff", "context", "hooks"],
+  "extensions": {
+    "com.openai": {
+      "hooks": "./codex/hooks.json",
+      "interface": {
+        "displayName": "segue",
+        "shortDescription": "Handoff card before compaction, pointer after; holds while subagents run.",
+        "category": "Productivity"
+      }
+    }
+  }
+}
