@@ -66,10 +66,10 @@ test("a card cut off by the output limit is still written", async ($, on) => {
 test("outside a git repository there is no census and the summary still stands", async ($, on) => {
   const seen = world(on, answered(`<summary>${SUMMARY}</summary>`), { git: false });
   const r = await $.session.compact({ trigger: "manual", messages: MESSAGES });
-  expect(seen.writes.length).toBe(0);
   expect(seen.prompts[0]).not.toContain("<census>");
+  expect(seen.writes.length).toBe(1);
+  expect(seen.writes[0].text).toContain("## Last messages at compaction");
   expect(r.messages[0].text).toContain(SUMMARY);
-  expect(r.messages[0].text).not.toContain("handoff card");
 });
 
 test("options: model, folder and census command are taken from userConfig",
@@ -102,7 +102,8 @@ test("text after /compact reaches the summary and the card", async ($, on) => {
 test("a reply without tags is read as the summary alone", async ($, on) => {
   const seen = world(on, answered(SUMMARY));
   const r = await $.session.compact({ trigger: "manual", messages: MESSAGES });
-  expect(seen.writes.length).toBe(0);
+  expect(seen.writes.length).toBe(1);
+  expect(seen.writes[0].text).not.toContain("## Next steps");
   expect(r.messages[0].text).toContain(SUMMARY);
 });
 
@@ -115,12 +116,14 @@ test("a short summary falls back to the built-in one, which still names the card
   expect(seen.toasts).toEqual([`built-in summary used (short reply); handoff card: ${CARD_PATH}`]);
 });
 
-test("a failed model call leaves the compaction to the built-in summary", async ($, on) => {
+test("a failed model call leaves the compaction to the built-in summary, and the card is still written", async ($, on) => {
   const seen = world(on, { isAnswered: false, reason: "api-error", status: null, kind: "authentication_failed" });
   const r = await $.session.compact({ trigger: "auto", messages: MESSAGES });
-  expect(seen.writes.length).toBe(0);
-  expect(r.messages.length).toBe(1);
+  expect(seen.writes[0].text).toContain("written by segue (the model wrote no card)");
+  expect(seen.writes[0].text).toContain("## Last messages at compaction");
+  expect(r.messages.length).toBe(2);
   expect(r.messages[0].text).toBe("built-in summary");
+  expect(r.messages[1].text).toContain(CARD_PATH);
 });
 
 test("a subagent's compaction is not touched", async ($, on) => {
@@ -421,4 +424,105 @@ test("disk task ledger is read when the transcript carries no TodoWrite", async 
   expect(card.text).toContain("## Task tracker at compaction");
   expect(card.text).toContain("Shipping v0.7.0");
   expect(card.text).toContain("Write docs");
+});
+
+// The last two user and agent messages count; an older pair before them must not be kept.
+const RECENT = [
+  { role: "user", text: "FIRST-USER-MESSAGE-OLD", toolUses: [] },
+  { role: "assistant", text: "old agent reply", toolUses: [] },
+  { role: "user", text: "Сначала ответь, что сломалось", toolUses: [] },
+  { role: "assistant", text: "Смотрю hooks/register.ts", toolUses: [] },
+  { role: "user", text: "А теперь почини тесты", toolUses: [] },
+  { role: "assistant", text: "Нужен ответ: ветка A или ветка B?", toolUses: [] },
+];
+
+test("the card keeps the last two user and agent messages verbatim, oldest first", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  await $.session.compact({ trigger: "auto", messages: RECENT });
+  const text = seen.writes[0].text;
+  expect(text).toContain("## Last messages at compaction");
+  expect(text).toContain("Сначала ответь, что сломалось");
+  expect(text).toContain("Нужен ответ: ветка A или ветка B?");
+  expect(text).not.toContain("FIRST-USER-MESSAGE-OLD");
+  expect(text).not.toContain("old agent reply");
+  expect(text.indexOf("Сначала ответь")).toBeLessThan(text.indexOf("А теперь почини"));
+});
+
+test("a long message is cut in the middle, keeping its beginning and its end", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  const long = `BEGIN ${"filler ".repeat(400)} END-OF-THE-QUESTION?`;
+  await $.session.compact({ trigger: "auto", messages: [{ role: "user", text: long, toolUses: [] }] });
+  const text = seen.writes[0].text;
+  expect(text).toContain("BEGIN filler");
+  expect(text).toContain("END-OF-THE-QUESTION?");
+  expect(text).toContain("chars cut");
+  expect(text).not.toContain("filler ".repeat(300));
+});
+
+test("the card records the user's language from their recent words", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  await $.session.compact({ trigger: "auto", messages: [
+    { role: "user", text: "Почини хук compaction, пожалуйста", toolUses: [] },
+    { role: "assistant", text: "Смотрю", toolUses: [] },
+    { role: "user", text: "проверь fix для register.ts", toolUses: [] },
+  ] });
+  expect(seen.writes[0].text).toContain("- user language: ru");
+});
+
+test("an English conversation is recorded as en", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  await $.session.compact({ trigger: "auto", messages: [
+    { role: "user", text: "Fix the compaction hook, then run the tests", toolUses: [] },
+    { role: "assistant", text: "Reading hooks/register.ts", toolUses: [] },
+  ] });
+  expect(seen.writes[0].text).toContain("- user language: en");
+});
+
+const BACKGROUND = [
+  { role: "user", text: "Запусти сборку в фоне", toolUses: [] },
+  { role: "assistant", text: "Запускаю две задачи", toolUses: [
+    { tool_use_id: "toolu_5", tool: "Bash", input: { command: "make bundle", description: "Build the bundle", run_in_background: true }, text: "Command running in background with ID: bg111aaa. Output is being written to: /private/tmp/claude-501/-Users-sasha/s1/tasks/bg111aaa.output. You will be notified when it completes." },
+    { tool_use_id: "toolu_6", tool: "Bash", input: { command: "sleep 600", description: "Wait for the mirror", run_in_background: true }, text: "Command running in background with ID: bg222bbb. Output is being written to: /private/tmp/claude-501/-Users-sasha/s1/tasks/bg222bbb.output. You will be notified when it completes." },
+  ] },
+  { role: "user", text: "<task-notification>\n<task-id>bg111aaa</task-id>\n<status>completed</status>\n<summary>Background command \"Build the bundle\" completed (exit code 0)</summary>\n</task-notification>", toolUses: [] },
+];
+
+test("background Bash tasks are listed with their output file; a finished one shows its notice", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  await $.session.compact({ trigger: "auto", messages: BACKGROUND });
+  const text = seen.writes[0].text;
+  expect(text).toContain("## Background tasks at compaction");
+  expect(text).toContain("- ✅ bg111aaa · Build the bundle · Background command \"Build the bundle\" completed (exit code 0) · output /private/tmp/claude-501/-Users-sasha/s1/tasks/bg111aaa.output");
+  expect(text).toContain("- ⏳ bg222bbb · Wait for the mirror · no completion notice · output /private/tmp/claude-501/-Users-sasha/s1/tasks/bg222bbb.output");
+});
+
+test("secrets typed in the recent messages are masked before the card is written", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  await $.session.compact({ trigger: "auto", messages: [
+    { role: "user", text: "токен ghp_abcdefghijklmnopqrstuvwxyz0123456789 и password: hunter2", toolUses: [] },
+    { role: "assistant", text: "ок", toolUses: [] },
+  ] });
+  const text = seen.writes[0].text;
+  expect(text).not.toContain("ghp_abcdef");
+  expect(text).not.toContain("hunter2");
+  expect(text).toContain("[redacted]");
+});
+
+test("a multi-line Bash command is written as one list line", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  await $.session.compact({ trigger: "auto", messages: [
+    { role: "user", text: "Собери", toolUses: [] },
+    { role: "assistant", text: "Запускаю", toolUses: [
+      { tool_use_id: "toolu_7", tool: "Bash", input: { command: "make bundle\n  && make test", run_in_background: true }, text: "Command running in background with ID: bg333ccc. Output is being written to: /private/tmp/x/tasks/bg333ccc.output. You will be notified when it completes." },
+    ] },
+  ] });
+  expect(seen.writes[0].text).toContain("- ⏳ bg333ccc · make bundle && make test · no completion notice · output /private/tmp/x/tasks/bg333ccc.output");
+});
+
+test("a code fence inside a message does not end the card's block early", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  await $.session.compact({ trigger: "auto", messages: [
+    { role: "user", text: "look:\n```js\nconst a = 1;\n```\nend", toolUses: [] },
+  ] });
+  expect(seen.writes[0].text).toContain("````text\nlook:\n```js\nconst a = 1;\n```\nend\n````");
 });

@@ -25,6 +25,12 @@ const MIN_SUMMARY_CHARS = 200;
 const MIN_HANDOFF_CHARS = 200;
 // How many parent directories to walk when looking for a project-root marker.
 const ANCESTOR_LIMIT = 10;
+// The verbatim tail of the conversation in the card: the last messages of each side, the language, the background tasks.
+const LAST_MESSAGES = 2;
+const LAST_MESSAGE_CHARS = 1600;
+const LANGUAGE_MESSAGES = 5;
+const BACKGROUND_TASKS = 10;
+const BACKGROUND_TASK_CHARS = 160;
 
 const SYSTEM =
   "You prepare the hand-over for a long coding-agent conversation that is about to be compacted. " +
@@ -285,8 +291,119 @@ function agentsSection(calls) {
       const x = u.input;
       const meta = [x.subagent_type, x.model, u.agentId && `id ${u.agentId}`].filter(Boolean).join(" · ");
       return `### ${i + 1}. ${x.description || "agent"}${meta ? " · " + meta : ""}\n` +
-        "```text\n" + clip(String(x.prompt || ""), AGENT_PROMPT_CHARS) + "\n```";
+        fence(clip(String(x.prompt || ""), AGENT_PROMPT_CHARS));
     }).join("\n\n");
+}
+
+// Long texts keep their beginning and their end: the question at the end of a message is what a resume needs.
+function clipMiddle(s, n) {
+  if (s.length <= n) return s;
+  const head = Math.ceil(n / 2);
+  return `${s.slice(0, head)}\n… [${s.length - n} chars cut] …\n${s.slice(s.length - (n - head))}`;
+}
+
+// A fence longer than any backtick run in the text, so the text cannot close it early.
+function fence(text) {
+  let longest = 0;
+  for (const m of text.matchAll(/`+/g)) longest = Math.max(longest, m[0].length);
+  const f = "`".repeat(Math.max(3, longest + 1));
+  return `${f}text\n${text}\n${f}`;
+}
+
+// Secrets the person may have typed in the conversation. The card outlives the session, so verbatim text is
+// masked before it is written.
+const SECRET_TOKENS = [
+  /\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}/g,
+  /\bsk-[A-Za-z0-9_-]{16,}/g,
+  /\bxox[abprs]-[A-Za-z0-9-]{10,}/g,
+  /\bAKIA[0-9A-Z]{16}\b/g,
+  /\bAIza[0-9A-Za-z_-]{35}\b/g,
+  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g,
+  /\bBearer\s+[A-Za-z0-9._~+/-]{16,}/gi,
+];
+const SECRET_ASSIGNMENT = /\b(password|passwd|secret|token|api[_-]?key)(\s*[:=]\s*)\S+/gi;
+
+function redact(text) {
+  let out = text;
+  for (const re of SECRET_TOKENS) out = out.replace(re, "[redacted]");
+  return out.replace(SECRET_ASSIGNMENT, "$1$2[redacted]");
+}
+
+// The last few user or agent texts, oldest first; tool results and empty turns are skipped.
+function tailMessages(messages, perRole) {
+  const counts = { user: 0, assistant: 0 };
+  const picked = [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!(m.role === "user" || m.role === "assistant") || !(m.text || "").trim() || counts[m.role] >= perRole) continue;
+    counts[m.role] += 1;
+    picked.unshift(m);
+  }
+  return picked;
+}
+
+// The person's language from the words of their last few messages, code and URLs left out. Cyrillic words
+// count as ru; below one word in five Cyrillic the text is reported as en.
+const PROSE_SKIP = /```[\s\S]*?```|`[^`\n]*`|https?:\/\/\S+/g;
+function userLanguage(messages) {
+  const recent = messages.filter(m => m.role === "user" && (m.text || "").trim()).slice(-LANGUAGE_MESSAGES);
+  const words = recent.map(m => m.text.replace(PROSE_SKIP, " ")).join(" ").split(/[^\p{L}]+/u).filter(Boolean);
+  if (!words.length) return "unknown";
+  const cyrillic = words.filter(w => /\p{Script=Cyrillic}/u.test(w)).length;
+  const share = Math.round((100 * cyrillic) / words.length);
+  return `${share >= 20 ? "ru" : "en"} (Cyrillic words ${share}% of the last user messages)`;
+}
+
+// The conversation's tail as it was written: the resume point that the summary can blur.
+function conversationSection(messages) {
+  const tail = tailMessages(messages, LAST_MESSAGES);
+  if (!tail.length) return "";
+  return "## Last messages at compaction\n" +
+    `- user language: ${userLanguage(messages)} — reply in the same language\n` +
+    "Verbatim from the transcript, oldest first; the middle is cut when a message is long.\n\n" +
+    tail.map(m => `### ${m.role === "user" ? "User" : "Agent"}\n` +
+      fence(clipMiddle(redact(m.text.trim()), LAST_MESSAGE_CHARS))).join("\n\n");
+}
+
+// One line, for list items that must not break across lines.
+function oneLine(s) {
+  return s.replace(/\s+/g, " ").trim();
+}
+
+function tagText(text, tag) {
+  const m = text.match(new RegExp(`<${tag}>([^<]*)</${tag}>`));
+  return m ? m[1].trim() : "";
+}
+
+// Bash calls started with run_in_background: the task id and output file the tool returned. A task
+// notification later in the conversation closes a task; without one it may still run, or be lost.
+function backgroundTasks(messages) {
+  const tasks = [];
+  messages.forEach((m, i) => {
+    for (const u of m.toolUses || []) {
+      if (u.tool !== "Bash" || !u.input || u.input.run_in_background !== true) continue;
+      const text = String(u.text || "");
+      const id = (text.match(/background with ID: (\S+?)\./) || [])[1];
+      if (!id) continue;
+      const output = ((text.match(/written to: (\S+)/) || [])[1] || "").replace(/\.$/, "");
+      const what = clip(oneLine(redact(String(u.input.description || u.input.command || ""))), BACKGROUND_TASK_CHARS);
+      const note = messages.slice(i + 1).map(x => x.text || "").find(t => t.includes(`<task-id>${id}</task-id>`));
+      const state = note ? oneLine(redact(tagText(note, "summary") || tagText(note, "status") || "finished")) : "";
+      tasks.push({ id, output, what, state });
+    }
+  });
+  return tasks;
+}
+
+function backgroundSection(messages) {
+  const tasks = backgroundTasks(messages).slice(-BACKGROUND_TASKS);
+  if (!tasks.length) return "";
+  return "## Background tasks at compaction\n" +
+    "Bash calls started with run_in_background. ✅ = a completion notice came back; " +
+    "⏳ = none did, so it may still run or be lost: read its output file before relaunching it.\n" +
+    tasks.map(t => t.state
+      ? `- ✅ ${t.id} · ${t.what} · ${t.state} · output ${t.output}`
+      : `- ⏳ ${t.id} · ${t.what} · no completion notice · output ${t.output}`).join("\n");
 }
 
 async function run($, argv) {
@@ -325,14 +442,14 @@ async function stamp($) {
   return { day: iso.slice(0, 10), time: iso.slice(11, 19).replace(/:/g, ""), zone: "UTC" };
 }
 
-async function saveHandoff($, dir, model, e, card) {
+async function saveHandoff($, dir, source, e, card) {
   const { day, time, zone } = await stamp($);
   const id = await $.session.id();
   const path = `${dir}/${day}-${time}-${id.slice(0, 8)}.md`;
   const head =
     `# Handoff before compaction — ${day} ${time} ${zone} (session ${id.slice(0, 8)})\n` +
     `- trigger: ${e.trigger} · session: ${id} · cwd: ${await $.session.cwd()}\n` +
-    `- written by ${model} from the transcript and a census of the machine: a hypothesis, not the truth\n` +
+    `- written by ${source}: a hypothesis, not the truth\n` +
     `- resume: read this card → check it against the repository's actual state → carry on from "Next steps"\n\n`;
   await $.fs.write(path, head + card + "\n");
   return path;
@@ -526,19 +643,24 @@ export function register(on, options) {
       const text = r.isAnswered ? r.text : "";
       let handoffPath = "";
       const written = block(text, "handoff");
-      // The running subagents, the todo tracker, and the project-state block are
-      // saved even when the small model wrote no card: these three carry the
-      // in-flight work that the Haiku summary would have had to reconstruct.
+      // The running subagents, the todo tracker, the project-state block, the verbatim tail and the background
+      // tasks are saved even when the small model wrote no card: they carry the in-flight work and the resume point
+      // that the Haiku summary would have had to reconstruct.
+      const modelWrote = written.length >= MIN_HANDOFF_CHARS;
       const card = [
-        written.length >= MIN_HANDOFF_CHARS ? written : "",
+        modelWrote ? written : "",
         todosBlock,
         projectBlockSection,
         running,
+        conversationSection(e.messages),
+        backgroundSection(e.messages),
       ].filter(Boolean).join("\n\n");
       if (card) {
         try {
           const dir = handoffDir.startsWith("~/") && home ? home + handoffDir.slice(1) : handoffDir;
-          handoffPath = await saveHandoff($, dir, model, e, card);
+          const source = modelWrote ? `${model} from the transcript and a census of the machine`
+            : "segue (the model wrote no card) from the transcript";
+          handoffPath = await saveHandoff($, dir, source, e, card);
         } catch (err) {
           $.ui.log(`segue: handoff not written: ${err}`);
         }

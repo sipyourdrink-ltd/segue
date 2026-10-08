@@ -22,7 +22,7 @@
 
 After a compaction the agent keeps a summary and loses the thread: which step it was on, what it had already tried, what you told it not to do. segue is a Claude Code plugin that hooks `/compact` and auto-compact and does three things in one pass:
 
-1. **Before** the conversation is replaced, it writes a **handoff card** to disk: what is done (with the commit or path that proves it), what is in flight, the next three steps, the traps.
+1. **Before** the conversation is replaced, it writes a **handoff card** to disk: what is done (with the commit or path that proves it), what is in flight, the next three steps, the traps. It also keeps the last user and agent messages verbatim (the middle cut when long), the person's language, and the background Bash tasks with their output files; secrets typed in those messages are masked before the file is written.
 2. It writes the **summary on Haiku** instead of the session's model. The session's model is never switched.
 3. **After** the compaction, the conversation carries the card's path and one instruction: read it, check it against the repository, carry on from "Next steps".
 
