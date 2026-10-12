@@ -47,6 +47,7 @@ test("writes the handoff card before compacting and names it in the summary", as
   expect(seen.writes[0].path).toBe(CARD_PATH);
   expect(seen.writes[0].text).toContain("## Next steps");
   expect(seen.writes[0].text).toContain("trigger: auto");
+  expect(seen.writes[0].text).toMatch(/- transcript: ~\/.claude\/projects\/\*\/\S+\.jsonl/);
   expect(seen.prompts[0]).toContain("<census>\n$ git status --porcelain=v1 --branch\n## main...origin/main [ahead 1]");
   expect(r.messages.length).toBe(1);
   expect(r.messages[0].text).toContain(SUMMARY);
@@ -426,17 +427,19 @@ test("disk task ledger is read when the transcript carries no TodoWrite", async 
   expect(card.text).toContain("Write docs");
 });
 
-// The last two user and agent messages count; an older pair before them must not be kept.
+// The last three user and agent messages count; an older pair before them must not be kept.
 const RECENT = [
   { role: "user", text: "FIRST-USER-MESSAGE-OLD", toolUses: [] },
   { role: "assistant", text: "old agent reply", toolUses: [] },
+  { role: "user", text: "Где падает?", toolUses: [] },
+  { role: "assistant", text: "В тестах хуков", toolUses: [] },
   { role: "user", text: "Сначала ответь, что сломалось", toolUses: [] },
   { role: "assistant", text: "Смотрю hooks/register.ts", toolUses: [] },
   { role: "user", text: "А теперь почини тесты", toolUses: [] },
   { role: "assistant", text: "Нужен ответ: ветка A или ветка B?", toolUses: [] },
 ];
 
-test("the card keeps the last two user and agent messages verbatim, oldest first", async ($, on) => {
+test("the card keeps the last three user and agent messages verbatim, oldest first", async ($, on) => {
   const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
   await $.session.compact({ trigger: "auto", messages: RECENT });
   const text = seen.writes[0].text;
@@ -450,13 +453,13 @@ test("the card keeps the last two user and agent messages verbatim, oldest first
 
 test("a long message is cut in the middle, keeping its beginning and its end", async ($, on) => {
   const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
-  const long = `BEGIN ${"filler ".repeat(400)} END-OF-THE-QUESTION?`;
+  const long = `BEGIN ${"filler ".repeat(700)} END-OF-THE-QUESTION?`;
   await $.session.compact({ trigger: "auto", messages: [{ role: "user", text: long, toolUses: [] }] });
   const text = seen.writes[0].text;
   expect(text).toContain("BEGIN filler");
   expect(text).toContain("END-OF-THE-QUESTION?");
   expect(text).toContain("chars cut");
-  expect(text).not.toContain("filler ".repeat(300));
+  expect(text).not.toContain("filler ".repeat(500));
 });
 
 test("the card records the user's language from their recent words", async ($, on) => {

@@ -26,8 +26,8 @@ const MIN_HANDOFF_CHARS = 200;
 // How many parent directories to walk when looking for a project-root marker.
 const ANCESTOR_LIMIT = 10;
 // The verbatim tail of the conversation in the card: the last messages of each side, the language, the background tasks.
-const LAST_MESSAGES = 2;
-const LAST_MESSAGE_CHARS = 1600;
+const LAST_MESSAGES = 3;
+const LAST_MESSAGE_CHARS = 3000;
 const LANGUAGE_MESSAGES = 5;
 const BACKGROUND_TASKS = 10;
 const BACKGROUND_TASK_CHARS = 160;
@@ -450,7 +450,8 @@ async function saveHandoff($, dir, source, e, card) {
     `# Handoff before compaction — ${day} ${time} ${zone} (session ${id.slice(0, 8)})\n` +
     `- trigger: ${e.trigger} · session: ${id} · cwd: ${await $.session.cwd()}\n` +
     `- written by ${source}: a hypothesis, not the truth\n` +
-    `- resume: read this card → check it against the repository's actual state → carry on from "Next steps"\n\n`;
+    `- transcript: ~/.claude/projects/*/${id}.jsonl — the card is a digest; the last user turns there are the resume point\n` +
+    `- resume: read this card → read the last user turns in the transcript → check both against the repository's actual state → carry on from "Next steps"\n\n`;
   await $.fs.write(path, head + card + "\n");
   return path;
 }
