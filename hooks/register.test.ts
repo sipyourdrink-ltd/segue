@@ -49,11 +49,14 @@ test("writes the handoff card before compacting and names it in the summary", as
   expect(seen.writes[0].text).toContain("trigger: auto");
   expect(seen.writes[0].text).toMatch(/- transcript: ~\/.claude\/projects\/\*\/\S+\.jsonl/);
   expect(seen.prompts[0]).toContain("<census>\n$ git status --porcelain=v1 --branch\n## main...origin/main [ahead 1]");
-  expect(r.messages.length).toBe(1);
+  expect(r.messages.length).toBe(2);
   expect(r.messages[0].text).toContain(SUMMARY);
   expect(r.messages[0].text).toContain(CARD_PATH);
   expect(r.messages[0].text).toContain("Continue the work from it");
   expect(r.messages[0].text).not.toContain("<handoff>");
+  expect(r.messages[1].text).toContain("standing request");
+  expect(r.messages[1].text).toContain("Improve the compaction hook");
+  expect(seen.prompts[0]).toContain("## Plan — every part of the user's standing request");
   expect(seen.toasts).toEqual([`handoff card: ${CARD_PATH}`]);
 });
 
@@ -113,7 +116,7 @@ test("a short summary falls back to the built-in one, which still names the card
   const r = await $.session.compact({ trigger: "auto", messages: MESSAGES });
   expect(seen.writes.length).toBe(1);
   expect(r.messages[0].text).toBe("built-in summary");
-  expect(r.messages[1].text).toContain(CARD_PATH);
+  expect(r.messages[r.messages.length - 1].text).toContain(CARD_PATH);
   expect(seen.toasts).toEqual([`built-in summary used (short reply); handoff card: ${CARD_PATH}`]);
 });
 
@@ -122,9 +125,10 @@ test("a failed model call leaves the compaction to the built-in summary, and the
   const r = await $.session.compact({ trigger: "auto", messages: MESSAGES });
   expect(seen.writes[0].text).toContain("written by segue (the model wrote no card)");
   expect(seen.writes[0].text).toContain("## Last messages at compaction");
-  expect(r.messages.length).toBe(2);
+  expect(r.messages.length).toBe(3);
   expect(r.messages[0].text).toBe("built-in summary");
-  expect(r.messages[1].text).toContain(CARD_PATH);
+  expect(r.messages[1].text).toContain("Improve the compaction hook");
+  expect(r.messages[2].text).toContain(CARD_PATH);
 });
 
 test("a subagent's compaction is not touched", async ($, on) => {
@@ -528,4 +532,60 @@ test("a code fence inside a message does not end the card's block early", async 
     { role: "user", text: "look:\n```js\nconst a = 1;\n```\nend", toolUses: [] },
   ] });
   expect(seen.writes[0].text).toContain("````text\nlook:\n```js\nconst a = 1;\n```\nend\n````");
+});
+
+test("a summary that mentions the tags does not open the card early", async ($, on) => {
+  const summary = `We discussed how the hook splits the reply into <summary> and <handoff>. ${SUMMARY}`;
+  const seen = world(on, answered(`<summary>${summary}</summary>\n<handoff>${CARD}</handoff>`));
+  const r = await $.session.compact({ trigger: "auto", messages: MESSAGES });
+  expect(seen.writes[0].text).not.toContain("</summary>");
+  expect(seen.writes[0].text).toContain("## Next steps\n1.");
+  expect(r.messages[0].text).toContain("splits the reply into <summary> and <handoff>.");
+});
+
+const REQUEST = "Please refactor the parser, add tests for every branch, update the README, bump the version and push the tag.";
+const REQUEST_MESSAGES = [
+  { role: "user", text: REQUEST, toolUses: [] },
+  { role: "assistant", text: "Starting with the parser.", toolUses: [] },
+  { role: "user", text: "<task-notification>\n<task-id>bg1</task-id>\n<status>completed</status>\n<summary>Background command \"lint\" completed (exit code 0)</summary>\n</task-notification>", toolUses: [] },
+  { role: "user", text: "[SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated background-task event.\n\n<task-notification>\n<task-id>bg2</task-id>\n<status>completed</status>\n</task-notification>", toolUses: [] },
+  { role: "user", text: "yes, go on", toolUses: [] },
+  { role: "assistant", text: "Parser done, on to the tests.", toolUses: [] },
+];
+
+test("the standing request is the user's last substantive message, saved once and re-issued after the summary", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  const r = await $.session.compact({ trigger: "auto", messages: REQUEST_MESSAGES });
+  const card = seen.writes[0].text;
+  expect(card).not.toContain("## Standing request");
+  expect(card.split(REQUEST).length).toBe(2);
+  expect(card).toContain("### User (standing request)\n");
+  expect(card).toContain("yes, go on");
+  expect(card).not.toContain("task-notification");
+  expect(card).not.toContain("SYSTEM NOTIFICATION");
+  expect(r.messages.length).toBe(2);
+  expect(r.messages[1].role).toBe("user");
+  expect(r.messages[1].text).toContain(REQUEST);
+  expect(r.messages[0].text).toContain('"Plan" lists every part');
+});
+
+test("a request that is the trailing message is kept once, by identity", async ($, on) => {
+  const messages = [...MESSAGES, { role: "user", text: REQUEST, toolUses: [] }];
+  world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  const r = await $.session.compact({ trigger: "auto", messages });
+  expect(r.messages.length).toBe(2);
+  expect(r.messages[1]).toEqual(messages[messages.length - 1]);
+});
+
+test("a request older than the tail gets its own section", async ($, on) => {
+  const filler = Array.from({ length: 4 }, (_, i) => [
+    { role: "user", text: `ok ${i}`, toolUses: [] },
+    { role: "assistant", text: `step ${i} done`, toolUses: [] },
+  ]).flat();
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  await $.session.compact({ trigger: "auto", messages: [REQUEST_MESSAGES[0], ...filler] });
+  const card = seen.writes[0].text;
+  expect(card).toContain("## Standing request\n");
+  expect(card.split(REQUEST).length).toBe(2);
+  expect(card).not.toContain("### User (standing request)");
 });

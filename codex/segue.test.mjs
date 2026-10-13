@@ -76,6 +76,8 @@ function world({ percent = 50, codexBin } = {}) {
   return { dir, env, call, cards, holdFile, argv: () => readFileSync(join(dir, "argv.txt"), "utf8").trim().split("\n"), prompt: () => readFileSync(join(dir, "prompt.txt"), "utf8") };
 }
 
+const prompt_of = w => w.prompt();
+
 test("pre-compact writes the card and names it", () => {
   const w = world();
   const { out } = w.call("pre-compact", { trigger: "manual" });
@@ -84,6 +86,8 @@ test("pre-compact writes the card and names it", () => {
   assert.match(card, /^# Handoff before compaction — \d{4}-\d{2}-\d{2} \d{6} [+-]\d{4} \(session sess-1\)/);
   assert.match(card, /written by codex exec \(default model\)/);
   assert.match(card, /## Next steps/);
+  assert.match(card, /## Standing request\n[^\n]*\n\n```text\nPort segue to Codex/);
+  assert.match(prompt_of(w), /## Plan — every part of the user's standing request/);
   assert.match(out.systemMessage, /^segue: handoff card .*sess-1\.md$/);
   const prompt = w.prompt();
   assert.match(prompt, /USER: Port segue to Codex/);
@@ -202,18 +206,23 @@ test("codex missing still saves the running subagents", () => {
   assert.ok(!card.includes("## Next steps"));
 });
 
-test("codex missing and nothing running: no card, a reason", () => {
+test("codex missing and nothing running: the card still carries the standing request", () => {
   const w = world({ codexBin: join(tmpdir(), "segue-no-such-codex") });
   const { out } = w.call("pre-compact", { trigger: "manual" });
-  assert.equal(out.systemMessage, "segue: no handoff card (codex exec failed)");
-  assert.equal(w.cards().length, 0);
+  assert.match(out.systemMessage, /^segue: handoff card /);
+  const [card] = w.cards();
+  assert.match(card, /## Standing request\n[^\n]*\n\n```text\nPort segue to Codex/);
+  assert.ok(!card.includes("## Next steps"), "no model section without the model");
 });
 
-test("a short reply writes no card", () => {
+test("a short reply still writes the card: the standing request is in it, the model's part is not", () => {
   const w = world();
   shim(w.dir, "<summary>too short</summary><handoff>too short</handoff>");
   const { out } = w.call("pre-compact", { trigger: "manual" });
-  assert.equal(out.systemMessage, "segue: no handoff card (short reply)");
+  assert.match(out.systemMessage, /^segue: handoff card /);
+  const [card] = w.cards();
+  assert.match(card, /## Standing request/);
+  assert.ok(!card.includes("too short"), "the model's short reply is left out");
 });
 
 test("garbage stdin is harmless", () => {

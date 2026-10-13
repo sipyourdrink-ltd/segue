@@ -37,7 +37,9 @@ const SYSTEM =
 
 const SUMMARY_INSTRUCTION =
   "Up to 15 sentences of plain prose, no headings and no lists: what was being done, as detailed " +
-  "and as compressed as possible — the goal, the decisions, files and paths, the current state, the next step.";
+  "and as compressed as possible — the goal, the decisions, files and paths, the current state, the next step. " +
+  "Then, past the sentence budget, every part of the user's standing request as one line each, in order, " +
+  "marked done, in progress or not started; a part that is far ahead is still listed.";
 
 const HANDOFF_INSTRUCTION =
   "A handoff card in markdown, one fact per line, with exactly these sections in this order " +
@@ -45,11 +47,19 @@ const HANDOFF_INSTRUCTION =
   "## Goal and repo — the session's goal in one line, repositories and paths, branch\n" +
   "## Done — `- ✅ <what> — <sha | PR | path>`; with no artefact in the transcript the line is `- ⚠️ unconfirmed: <what>`\n" +
   "## In flight — `- ⏳ <what> — pid <n> · done when <condition> · resume: <command>`; or `none`\n" +
-  "## Next steps — up to 3, in order, each with a command or a path\n" +
+  "## Plan — every part of the user's standing request, in order, one line each: `- ✅|⏳|⬜ <part> — <evidence, command or path>`; " +
+  "a part is listed even when it is far ahead or was only implied by the request; never fewer lines than the request has parts\n" +
+  "## Next steps — the first open lines of the plan, up to 3, each with a command or a path\n" +
   "## Only the user — what only the person can do or decide; or `none`\n" +
   "## Read first — up to 5 paths\n" +
   "## Traps — what was tried and failed, and why; constraints the user stated\n" +
   "Take facts only from the transcript and the census. What is in neither, leave out.";
+
+// The user's standing request: the last message of theirs with this many words of prose, kept verbatim in the card.
+const REQUEST_MIN_WORDS = 6;
+const REQUEST_CHARS = 6000;
+// Wrappers the host puts into user turns that are not the user's words.
+const HOST_WRAPPERS = /<(environment_context|user_instructions|turn_aborted|task-notification|system-reminder)>[\s\S]*?<\/\1>/g;
 
 function clip(s, n) {
   if (!s) return "";
@@ -156,6 +166,40 @@ function block(text, tag) {
   return m ? m[1].trim() : "";
 }
 
+// The handoff is looked for after the summary's close: a summary that mentions the tags must not open the card early.
+function handoffBlock(text) {
+  const s = text.match(/<summary>([\s\S]*?)(?:<\/summary>|$)/);
+  return block(text.slice(s ? s.index + s[0].length : 0), "handoff");
+}
+
+// The user's last message with at least REQUEST_MIN_WORDS words of prose, so that a bare "yes" points back at
+// the request it answered; the last non-empty one when none qualifies.
+function standingRequest(lines) {
+  let fallback = "";
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const l = lines[i];
+    if (l.type !== "response_item" || !l.payload || l.payload.type !== "message" || l.payload.role !== "user") continue;
+    const text = messageText(l.payload).replace(HOST_WRAPPERS, " ").trim();
+    if (!text) continue;
+    if (text.split(/\s+/).length >= REQUEST_MIN_WORDS) return text;
+    if (!fallback) fallback = text;
+  }
+  return fallback;
+}
+
+function requestSection(text) {
+  if (!text) return "";
+  const body = text.length > REQUEST_CHARS
+    ? `${text.slice(0, REQUEST_CHARS / 2)}\n… [${text.length - REQUEST_CHARS} chars cut] …\n${text.slice(text.length - REQUEST_CHARS / 2)}`
+    : text;
+  let longest = 0;
+  for (const m of body.matchAll(/`+/g)) longest = Math.max(longest, m[0].length);
+  const f = "`".repeat(Math.max(3, longest + 1));
+  return "## Standing request\n" +
+    "The user's last substantive message, verbatim. Every part of it is the task; the summary and the plan say how far it got.\n\n" +
+    `${f}text\n${body}\n${f}`;
+}
+
 function run(argv, cwd) {
   const r = spawnSync(argv[0], argv.slice(1), { cwd, encoding: "utf8", timeout: 20_000 });
   return !r.error && r.status === 0 ? r.stdout.trim() : "";
@@ -230,7 +274,8 @@ function pointer(path, censusCommand, agents) {
     "Continue the work from it: read that file first, check it against the actual state " +
     (censusCommand ? "(run `" + censusCommand + "`)" : "(git status, running processes)") +
     ", then carry on from its \"Next steps\". " +
-    "The card is a hypothesis; the machine is the truth." +
+    "The card is a hypothesis; the machine is the truth. " +
+    "Its \"Plan\" lists every part of the user's standing request with its state: finish all open parts, not only the next one." +
     (agents ? ` ${agents} subagent(s) were running at compaction and may not report back: ` +
       "the card's \"Subagents running at compaction\" has their exact prompts; " +
       "check their output on disk and relaunch what is unfinished instead of waiting." : "");
@@ -306,11 +351,11 @@ function preCompact(s, e, st) {
       `In the <summary> block: ${SUMMARY_INSTRUCTION}\n\n` +
       `In the <handoff> block: ${HANDOFF_INSTRUCTION}${extra}`;
     const r = complete(s, prompt);
-    written = block(r.text, "handoff");
+    written = handoffBlock(r.text);
     why = r.why || (written.length < MIN_HANDOFF_CHARS ? "short reply" : "");
   }
-  // The running subagents are saved even when the model wrote no card.
-  const card = [written.length >= MIN_HANDOFF_CHARS ? written : "", agentsSection(agents)].filter(Boolean).join("\n\n");
+  // The standing request and the running subagents are saved even when the model wrote no card.
+  const card = [written.length >= MIN_HANDOFF_CHARS ? written : "", requestSection(standingRequest(lines)), agentsSection(agents)].filter(Boolean).join("\n\n");
   if (!card) return { systemMessage: `segue: no handoff card (${why})` };
   const { day, time, zone } = stamp();
   const id = String(e.session_id || "unknown");

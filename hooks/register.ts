@@ -28,6 +28,10 @@ const ANCESTOR_LIMIT = 10;
 // The verbatim tail of the conversation in the card: the last messages of each side, the language, the background tasks.
 const LAST_MESSAGES = 3;
 const LAST_MESSAGE_CHARS = 3000;
+// The user's standing request: the last message of theirs with this many words of prose, kept verbatim
+// in the card and re-issued after the summary.
+const REQUEST_MIN_WORDS = 6;
+const REQUEST_CHARS = 6000;
 const LANGUAGE_MESSAGES = 5;
 const BACKGROUND_TASKS = 10;
 const BACKGROUND_TASK_CHARS = 160;
@@ -41,7 +45,9 @@ const SYSTEM =
 
 const SUMMARY_INSTRUCTION =
   "Up to 15 sentences of plain prose, no headings and no lists: what was being done, as detailed " +
-  "and as compressed as possible — the goal, the decisions, files and paths, the current state, the next step.";
+  "and as compressed as possible — the goal, the decisions, files and paths, the current state, the next step. " +
+  "Then, past the sentence budget, every part of the user's standing request as one line each, in order, " +
+  "marked done, in progress or not started; a part that is far ahead is still listed.";
 
 const HANDOFF_INSTRUCTION =
   "A handoff card in markdown, one fact per line, with exactly these sections in this order " +
@@ -50,7 +56,9 @@ const HANDOFF_INSTRUCTION =
   "## Done — `- ✅ <what> — <sha | PR | path>`; with no artefact in the transcript the line is `- ⚠️ unconfirmed: <what>`\n" +
   "## In flight — `- ⏳ <what> — pid <n> · done when <condition> · resume: <command>`; or `none`\n" +
   "## Open work in project trees — if the project state block names peel/breaker/improve open items, quote their ids and one-line what each one is, verbatim from that block; or `none`\n" +
-  "## Next steps — up to 3, in order, each with a command or a path\n" +
+  "## Plan — every part of the user's standing request, in order, one line each: `- ✅|⏳|⬜ <part> — <evidence, command or path>`; " +
+  "a part is listed even when it is far ahead or was only implied by the request; never fewer lines than the request has parts\n" +
+  "## Next steps — the first open lines of the plan, up to 3, each with a command or a path\n" +
   "## Only the user — what only the person can do or decide; or `none`\n" +
   "## Read first — up to 5 paths\n" +
   "## Traps — what was tried and failed, and why; constraints the user stated\n" +
@@ -89,6 +97,14 @@ function block(text, tag) {
   // The closing tag may be lost to the output limit; the opening one may not.
   const m = text.match(new RegExp(`<${tag}>([\\s\\S]*?)(?:</${tag}>|$)`));
   return m ? m[1].trim() : "";
+}
+
+// The two blocks of the reply. The handoff is looked for after the summary's close: a summary that
+// mentions the tags, as one about this hook does, must not open the card early.
+function blocks(text) {
+  const s = text.match(/<summary>([\s\S]*?)(?:<\/summary>|$)/);
+  const from = s ? s.index + s[0].length : 0;
+  return { summary: s ? s[1].trim() : "", handoff: block(text.slice(from), "handoff") };
 }
 
 // The latest TodoWrite tool call in the transcript carries the task tracker's
@@ -329,15 +345,47 @@ function redact(text) {
   return out.replace(SECRET_ASSIGNMENT, "$1$2[redacted]");
 }
 
-// The last few user or agent texts, oldest first; tool results and empty turns are skipped.
-function tailMessages(messages, perRole) {
+// What the person wrote, with the host's own wrappers removed: task notifications, system reminders and
+// command echoes arrive as user messages but are not the user's words.
+const HOST_WRAPPERS = /<(task-notification|system-reminder|local-command-stdout|local-command-caveat|command-name|command-message|command-args|ide_opened_file|ide_selection)>[\s\S]*?<\/\1>/g;
+const HOST_PREAMBLE = /\[SYSTEM NOTIFICATION[^\]]*\][^\n]*(?:\n(?!\n)[^\n]*)*/g;
+function prose(m) {
+  if (!m || m.role !== "user" || typeof m.text !== "string") return "";
+  return m.text.replace(HOST_WRAPPERS, " ").replace(HOST_PREAMBLE, " ").trim();
+}
+
+// The user's standing request: their last message with at least REQUEST_MIN_WORDS words of prose, so that
+// a bare "yes" or "go on" points back at the request it answered. Null when nothing qualifies.
+function standingRequest(messages) {
+  let fallback = null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const text = prose(messages[i]);
+    if (!text) continue;
+    if (text.split(/\s+/).length >= REQUEST_MIN_WORDS) return { message: messages[i], text };
+    if (!fallback) fallback = { message: messages[i], text };
+  }
+  return fallback;
+}
+
+// Written only when the request is older than the tail; in the tail it is marked instead.
+function requestSection(request, messages) {
+  if (!request || tailMessages(messages, LAST_MESSAGES, request).some(m => m.request)) return "";
+  return "## Standing request\n" +
+    "The user's last substantive message, verbatim. Every part of it is the task; the summary and the plan say how far it got.\n\n" +
+    fence(clipMiddle(redact(request.text), REQUEST_CHARS));
+}
+
+// The last few user or agent texts, oldest first; tool results, host wrappers and empty turns are skipped.
+function tailMessages(messages, perRole, request) {
   const counts = { user: 0, assistant: 0 };
   const picked = [];
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
-    if (!(m.role === "user" || m.role === "assistant") || !(m.text || "").trim() || counts[m.role] >= perRole) continue;
+    if (!(m.role === "user" || m.role === "assistant") || counts[m.role] >= perRole) continue;
+    const text = m.role === "user" ? prose(m) : (m.text || "").trim();
+    if (!text) continue;
     counts[m.role] += 1;
-    picked.unshift(m);
+    picked.unshift({ role: m.role, text, request: Boolean(request && request.message === m) });
   }
   return picked;
 }
@@ -346,8 +394,8 @@ function tailMessages(messages, perRole) {
 // count as ru; below one word in five Cyrillic the text is reported as en.
 const PROSE_SKIP = /```[\s\S]*?```|`[^`\n]*`|https?:\/\/\S+/g;
 function userLanguage(messages) {
-  const recent = messages.filter(m => m.role === "user" && (m.text || "").trim()).slice(-LANGUAGE_MESSAGES);
-  const words = recent.map(m => m.text.replace(PROSE_SKIP, " ")).join(" ").split(/[^\p{L}]+/u).filter(Boolean);
+  const recent = messages.map(prose).filter(Boolean).slice(-LANGUAGE_MESSAGES);
+  const words = recent.map(t => t.replace(PROSE_SKIP, " ")).join(" ").split(/[^\p{L}]+/u).filter(Boolean);
   if (!words.length) return "unknown";
   const cyrillic = words.filter(w => /\p{Script=Cyrillic}/u.test(w)).length;
   const share = Math.round((100 * cyrillic) / words.length);
@@ -355,14 +403,14 @@ function userLanguage(messages) {
 }
 
 // The conversation's tail as it was written: the resume point that the summary can blur.
-function conversationSection(messages) {
-  const tail = tailMessages(messages, LAST_MESSAGES);
+function conversationSection(messages, request) {
+  const tail = tailMessages(messages, LAST_MESSAGES, request);
   if (!tail.length) return "";
   return "## Last messages at compaction\n" +
     `- user language: ${userLanguage(messages)} — reply in the same language\n` +
     "Verbatim from the transcript, oldest first; the middle is cut when a message is long.\n\n" +
-    tail.map(m => `### ${m.role === "user" ? "User" : "Agent"}\n` +
-      fence(clipMiddle(redact(m.text.trim()), LAST_MESSAGE_CHARS))).join("\n\n");
+    tail.map(m => `### ${m.role === "user" ? (m.request ? "User (standing request)" : "User") : "Agent"}\n` +
+      fence(clipMiddle(redact(m.text), LAST_MESSAGE_CHARS))).join("\n\n");
 }
 
 // One line, for list items that must not break across lines.
@@ -539,12 +587,25 @@ function pointer(path, censusCommand, agents, hasProjectState, hasTodos) {
     "Continue the work from it: read that file first, check it against the actual state " +
     (censusCommand ? "(run `" + censusCommand + "`)" : "(git status, running processes)") +
     ", then carry on from its \"Next steps\". " +
-    "The card is a hypothesis; the machine is the truth." +
+    "The card is a hypothesis; the machine is the truth. " +
+    "Its \"Plan\" lists every part of the user's standing request with its state: finish all open parts, not only the next one." +
     todosHint +
     stateHint +
     (agents ? ` ${agents} subagent(s) were running at compaction and may not report back: ` +
       "the card's \"Subagents running at compaction\" has their exact prompts; " +
       "check their output on disk and relaunch what is unfinished instead of waiting." : "");
+}
+
+// The standing request re-issued after the summary, verbatim: the summary says how far it got, this says
+// what all of it was. The trailing message is kept by identity elsewhere, so it is not repeated here.
+function reissue(request, messages) {
+  if (!request || request.message === messages[messages.length - 1]) return [];
+  return [{
+    role: "user",
+    text: "The user's standing request, verbatim as sent before the compaction. The summary above says how far it got; " +
+      "every part of it is still the task:\n\n" + clipMiddle(request.text, REQUEST_CHARS),
+    toolUses: [],
+  }];
 }
 
 // The context's fill as the status line has it; unknown when the engine does not say.
@@ -643,17 +704,22 @@ export function register(on, options) {
       });
       const text = r.isAnswered ? r.text : "";
       let handoffPath = "";
-      const written = block(text, "handoff");
+      const parsed = blocks(text);
+      // A reply without either tag is read as the summary alone.
+      const body = parsed.summary || (text.includes("<handoff>") ? "" : text.trim());
+      const written = parsed.handoff;
+      const request = standingRequest(e.messages);
       // The running subagents, the todo tracker, the project-state block, the verbatim tail and the background
       // tasks are saved even when the small model wrote no card: they carry the in-flight work and the resume point
       // that the Haiku summary would have had to reconstruct.
       const modelWrote = written.length >= MIN_HANDOFF_CHARS;
       const card = [
         modelWrote ? written : "",
+        requestSection(request, e.messages),
         todosBlock,
         projectBlockSection,
         running,
-        conversationSection(e.messages),
+        conversationSection(e.messages, request),
         backgroundSection(e.messages),
       ].filter(Boolean).join("\n\n");
       if (card) {
@@ -672,13 +738,10 @@ export function register(on, options) {
       // data. All three are best-effort and each is gated on the relevant
       // directory existing; a failure never fails the compaction.
       const dataDir = await (async () => { try { return await $.env.get("CLAUDE_PLUGIN_DATA"); } catch (_) { return ""; } })();
-      const bodyForPersist = block(text, "summary") || (text.includes("<handoff>") ? "" : text.trim());
-      await saveSummary($, handoffPath, bodyForPersist, dataDir);
+      await saveSummary($, handoffPath, body, dataDir);
       await appendCardIndex($, handoffPath, e, dataDir);
       await writeProjectPointer($, cwd, handoffPath);
       const host = await hostLabel($);
-      // A reply without either tag is read as the summary alone.
-      const body = block(text, "summary") || (text.includes("<handoff>") ? "" : text.trim());
       if (body.length < MIN_SUMMARY_CHARS) {
         const why = r.isAnswered ? "short reply" : r.reason;
         $.ui.log(`segue: fallback to built-in (${why})`);
@@ -687,7 +750,7 @@ export function register(on, options) {
         }
         const res = await next(e);
         if (!handoffPath || !res.messages) return res;
-        return { ...res, messages: [...res.messages, { role: "user", text: pointer(handoffPath, censusCommand, agents.length, Boolean(projectBlock), todos.length > 0), toolUses: [] }] };
+        return { ...res, messages: [...res.messages, ...reissue(request, e.messages), { role: "user", text: pointer(handoffPath, censusCommand, agents.length, Boolean(projectBlock), todos.length > 0), toolUses: [] }] };
       }
       const u = r.usage;
       const hostTag = host ? ` [${host}]` : "";
@@ -704,7 +767,7 @@ export function register(on, options) {
           (handoffPath ? "\n\n" + pointer(handoffPath, censusCommand, agents.length, Boolean(projectBlock), todos.length > 0) : ""),
         toolUses: [],
       };
-      const kept = [summary];
+      const kept = [summary, ...reissue(request, e.messages)];
       // A trailing plain prompt from the person stays verbatim, by identity.
       const last = e.messages[e.messages.length - 1];
       if (last && last.role === "user" && last.text && !(last.toolResults && last.toolResults.length) && !(last.toolUses && last.toolUses.length)) {

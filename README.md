@@ -22,13 +22,14 @@
 
 After a compaction the agent keeps a summary and loses the thread: which step it was on, what it had already tried, what you told it not to do. segue is a Claude Code plugin that hooks `/compact` and auto-compact and does three things in one pass:
 
-1. **Before** the conversation is replaced, it writes a **handoff card** to disk: what is done (with the commit or path that proves it), what is in flight, the next three steps, the traps. It also keeps the last user and agent messages verbatim (the middle cut when long), the person's language, and the background Bash tasks with their output files; secrets typed in those messages are masked before the file is written.
+1. **Before** the conversation is replaced, it writes a **handoff card** to disk: what is done (with the commit or path that proves it), what is in flight, the plan — every part of your request with its state, not only the next step — the traps. It also keeps your standing request and the last user and agent messages verbatim (the middle cut when long), the person's language, and the background Bash tasks with their output files; secrets typed in those messages are masked before the file is written.
 2. It writes the **summary on Haiku** instead of the session's model. The session's model is never switched.
-3. **After** the compaction, the conversation carries the card's path and one instruction: read it, check it against the repository, carry on from "Next steps".
+3. **After** the compaction, the conversation carries the summary, your standing request verbatim, the card's path and one instruction: read it, check it against the repository, finish every open part of the plan.
 
 ### at a glance
 
 - **A card on disk, not only a summary in context.** It survives the next compaction, a crash, and a move to another session.
+- **Your request survives verbatim.** The last substantive message you wrote is re-issued after the summary, from the transcript, not from the model; a ten-part task stays a ten-part task. Task notifications and other host text that arrive as user turns are not mistaken for it.
 - **About a cent per compaction.** One call to a small model over a transcript with tool output clipped. Numbers below.
 - **Fails open.** A refused call, an API error, a short reply, a thrown error: the built-in summary runs as if segue were not there.
 - **Subagents are not lost to a compaction.** An automatic compaction waits for the ones still running, a new one is refused when the context is nearly full, and the prompts of any still running when the summary is written go into the card.
@@ -117,14 +118,16 @@ The smaller context afterwards matters more than the call itself: every later tu
 
 ### what the agent reads afterwards
 
-The compacted conversation is the summary, followed by this (and then your last message, if you had just sent one):
+The compacted conversation is the summary, followed by this, and then your standing request as you wrote it (the last message of yours with at least six words; a bare "yes" points back at the request it answered):
 
 ```text
 Before this compaction a handoff card was written to
 /Users/you/.claude/handoffs/2026-10-04-161207-3f9c2a1b.md. Continue the work
 from it: read that file first, check it against the actual state (git status,
 running processes), then carry on from its "Next steps". The card is a
-hypothesis; the machine is the truth.
+hypothesis; the machine is the truth. Its "Plan" lists every part of the
+user's standing request with its state: finish all open parts, not only the
+next one.
 ```
 
 And the card it points to looks like this (an illustrative example, not a recording):
@@ -145,10 +148,17 @@ And the card it points to looks like this (an illustrative example, not a record
 ## In flight
 - ⏳ test suite — 3 failing in tests/invoice.test.ts · resume: `npm test -- invoice`
 
+## Plan
+- ✅ Money type with integer cents — src/money.ts
+- ⏳ fix the half-cent case in `roundLine()` — src/invoice.ts:88
+- ⬜ `npm test -- invoice` green
+- ⬜ migrate the exporter to Money — src/export.ts
+- ⬜ push fix/rounding and open the PR
+
 ## Next steps
 1. fix the half-cent case in `roundLine()` — src/invoice.ts:88
 2. `npm test -- invoice`
-3. push fix/rounding and open the PR
+3. migrate the exporter — src/export.ts
 
 ## Only the user
 - decide whether historical invoices are re-rounded
@@ -162,7 +172,7 @@ And the card it points to looks like this (an illustrative example, not a record
 - banker's rounding was tried and rejected: totals must match the printed invoices
 ```
 
-A line under **Done** carries a ✅ only when the transcript holds the artefact for it. Everything else is marked unconfirmed, so the agent re-checks instead of trusting.
+A line under **Done** carries a ✅ only when the transcript holds the artefact for it. Everything else is marked unconfirmed, so the agent re-checks instead of trusting. **Plan** has one line per part of your request, however far ahead; **Next steps** are its first open lines. Below the model's sections the card carries what the hook copies from the transcript itself: your standing request (marked in the last messages, or in its own section when older than them), the task tracker, the last messages, the background tasks.
 
 ### options
 
@@ -201,7 +211,7 @@ Text you pass to `/compact <instructions>` reaches the model for both the summar
    ├─ census            git state, or your censusCommand
    ├─ one model call    transcript (tool I/O clipped) + census  →  <summary> + <handoff>
    ├─ write the card    <handoffDir>/<date>-<time>-<session>.md
-   ├─ replace history   summary + "continue from <card>"  (+ your last message, verbatim)
+   ├─ replace history   summary + "continue from <card>" + your standing request, verbatim
    └─ toast             handoff card: <path>
 ```
 
@@ -209,6 +219,8 @@ Text you pass to `/compact <instructions>` reaches the model for both the summar
 |---|---|
 | the model call fails or the summary is too short | the built-in summary runs; a card that was written is still named after it |
 | the card is cut off by the output limit | it is written as far as it got |
+| the summary mentions `<summary>` or `<handoff>` (a conversation about this hook) | the card is read after the summary's close, so the tags inside it do not open the card early |
+| your last message is a short "yes" or "go on" | the request it answered is the standing request: the last message of yours with six words or more |
 | the card cannot be written | the summary stands without the pointer |
 | a subagent compacts its own transcript | segue stays out of it |
 | auto-compaction comes while subagents of the conversation are still running | it is held back (`{ skip }`): the engine asks again before each request, and the compaction runs once they have answered, with their answers in the transcript. The hold ends at 96% of the context or after `holdForAgentsMinutes`, whichever first |
