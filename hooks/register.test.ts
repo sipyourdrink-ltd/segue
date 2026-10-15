@@ -589,3 +589,99 @@ test("a request older than the tail gets its own section", async ($, on) => {
   expect(card.split(REQUEST).length).toBe(2);
   expect(card).not.toContain("### User (standing request)");
 });
+
+// A Workflow started in the background answers with its names, as the launch result has them.
+const WF_DIR = "/home/u/.claude/projects/-home-u-work/s1/subagents/workflows/wf_06936700-e70";
+const WF_SCRIPT = "/home/u/.claude/projects/-home-u-work/s1/workflows/scripts/benefits-audit-wf_06936700-e70.js";
+const WF_TERMINAL = "/home/u/.claude/projects/-home-u-work/s1/workflows/wf_06936700-e70.json";
+const WORKFLOW = [
+  { role: "user", text: "Run the benefits audit as a workflow in the background", toolUses: [] },
+  { role: "assistant", text: "Started", toolUses: [
+    { tool_use_id: "toolu_8", tool: "Workflow", input: { scriptPath: WF_SCRIPT },
+      text: `Workflow launched in background. Task ID: w4wlkhzl6 · Transcript dir: ${WF_DIR} · Script file: ${WF_SCRIPT}` },
+  ] },
+];
+
+test("a Workflow running in the background lands in the card with its task and run ids and a resume hint", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  const r = await $.session.compact({ trigger: "auto", messages: WORKFLOW });
+  const text = seen.writes[0].text;
+  expect(text).toContain("## Subagents running at compaction");
+  expect(text).toContain("### 1. Workflow run · task w4wlkhzl6 · run wf_06936700-e70");
+  expect(text).toContain(`- journal: ${WF_DIR}/journal.jsonl; ended when ${WF_TERMINAL} exists`);
+  expect(text).toContain(`\`Workflow {scriptPath: "${WF_SCRIPT}", resumeFromRunId: "wf_06936700-e70"}\``);
+  expect(text).toContain("do not relaunch them");
+  expect(text).not.toContain("relaunch the unfinished ones");
+  expect(r.messages[0].text).toContain("1 workflow run(s) were running at compaction");
+  expect(r.messages[0].text).not.toContain("subagent(s) were running");
+});
+
+test("the launch result with newlines and a summary line is read the same way", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  await $.session.compact({ trigger: "auto", messages: [WORKFLOW[0], { role: "assistant", text: "Started", toolUses: [
+    { tool_use_id: "toolu_9", tool: "Workflow", input: {},
+      text: `Workflow launched in background. Task ID: w4wlkhzl6\nSummary: Audit of benefits, with sources\nTranscript dir: ${WF_DIR}\nScript file: ${WF_SCRIPT}\n(Edit this file and re-invoke Workflow)` },
+  ] }] });
+  expect(seen.writes[0].text).toContain("### 1. Workflow Audit of benefits, with sources · task w4wlkhzl6 · run wf_06936700-e70");
+});
+
+test("a Workflow launch result without its names is listed with the ids unknown, not dropped", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  await $.session.compact({ trigger: "auto", messages: [WORKFLOW[0], { role: "assistant", text: "Started", toolUses: [
+    { tool_use_id: "toolu_10", tool: "Workflow", input: {}, text: "Workflow launched in background." },
+  ] }] });
+  const text = seen.writes[0].text;
+  expect(text).toContain("### 1. Workflow run · task id unknown · run id unknown");
+  expect(text).toContain("- resume only if it stopped: id unknown");
+});
+
+test("a Workflow whose notice came back or whose terminal record exists is not in flight", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  on("fs.exists", async (_$, e) => ({ value: e.path === WF_TERMINAL }));
+  await $.session.compact({ trigger: "auto", messages: WORKFLOW });
+  expect(seen.writes[0].text).not.toContain("## Subagents running at compaction");
+});
+
+test("a Workflow closed by its task notification is not in flight", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  await $.session.compact({ trigger: "auto", messages: [...WORKFLOW,
+    { role: "user", text: "<task-notification>\n<task-id>w4wlkhzl6</task-id>\n<status>completed</status>\n</task-notification>", toolUses: [] }] });
+  expect(seen.writes[0].text).not.toContain("## Subagents running at compaction");
+});
+
+test("an automatic compaction is not held for a Workflow run alone", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  on("session.usage", async () => ({ value: { startedAt: 0, context: { window: 200_000, percent: 91 } } }));
+  on("agent.list", async () => ({ value: [] }));
+  const r = await $.session.compact({ trigger: "auto", messages: WORKFLOW });
+  expect(r.skip).toBeUndefined();
+  expect(seen.writes.length).toBe(1);
+});
+
+test("the In flight line takes a pid, a task id or a run id, and the slot is omitted when there is none", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  await $.session.compact({ trigger: "auto", messages: MESSAGES });
+  expect(seen.prompts[0]).toContain("<pid n | task <id> | run <wf_id>>");
+  expect(seen.prompts[0]).toContain("omit the slot rather than write that it is missing");
+  expect(seen.prompts[0]).not.toContain("— pid <n> ·");
+});
+
+test("a background task with no notice in the messages but an idle output is reported as idle, not as missing", async ($, on) => {
+  const NOW = 1_800_000_000_000;
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`), { now: () => NOW });
+  on("fs.stat", async (_$, e) => e.path.endsWith("bg222bbb.output")
+    ? { value: { kind: "file", size: 2048, mtimeMs: NOW - 15 * 60_000, isLink: false } }
+    : { deny: "not found" });
+  await $.session.compact({ trigger: "auto", messages: BACKGROUND });
+  const text = seen.writes[0].text;
+  expect(text).toContain("- ⏳ bg222bbb · Wait for the mirror · output idle 15m, read it · output /private/tmp/claude-501/-Users-sasha/s1/tasks/bg222bbb.output");
+  expect(text).toContain("- ✅ bg111aaa · Build the bundle");
+});
+
+test("a fresh or empty background output keeps the no-notice line", async ($, on) => {
+  const NOW = 1_800_000_000_000;
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`), { now: () => NOW });
+  on("fs.stat", async () => ({ value: { kind: "file", size: 0, mtimeMs: NOW - 15 * 60_000, isLink: false } }));
+  await $.session.compact({ trigger: "auto", messages: BACKGROUND });
+  expect(seen.writes[0].text).toContain("- ⏳ bg222bbb · Wait for the mirror · no completion notice · output");
+});
