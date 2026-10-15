@@ -674,7 +674,7 @@ test("a background task with no notice in the messages but an idle output is rep
     : { deny: "not found" });
   await $.session.compact({ trigger: "auto", messages: BACKGROUND });
   const text = seen.writes[0].text;
-  expect(text).toContain("- ⏳ bg222bbb · Wait for the mirror · output idle 15m, read it · output /private/tmp/claude-501/-Users-sasha/s1/tasks/bg222bbb.output");
+  expect(text).toMatch(/- ⏳ bg222bbb · Wait for the mirror · output idle 15m, read it · output \S+\/tasks\/bg222bbb\.output/);
   expect(text).toContain("- ✅ bg111aaa · Build the bundle");
 });
 
