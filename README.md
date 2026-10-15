@@ -225,6 +225,8 @@ Text you pass to `/compact <instructions>` reaches the model for both the summar
 | a subagent compacts its own transcript | segue stays out of it |
 | auto-compaction comes while subagents of the conversation are still running | it is held back (`{ skip }`): the engine asks again before each request, and the compaction runs once they have answered, with their answers in the transcript. The hold ends at 96% of the context or after `holdForAgentsMinutes`, whichever first |
 | subagents are still running when the compaction does run (`/compact`, the hold ran out) | their exact prompts go into the card, from the transcript, and the continued conversation is told to check their output on disk and relaunch the unfinished ones rather than wait |
+| a Workflow run started in the background has not reported back at compaction | the card lists it with its task id, run id and a resume hint, not a relaunch order, and the compaction is not held for it: the run goes on and reports back. After the compaction the SessionStart hook prints each run of the session as it stands on disk then: running (journal age, phase, retries), stale after 30 idle minutes, or ended with its status and output file |
+| a background command's completion notice is not among the compacted messages | an output file that is non-empty and untouched for a minute is reported as idle, to be read, instead of as missing |
 | the conversation starts a subagent at `agentGuardPercent` of the context or above | the call is refused with the reason: a subagent started now would be stopped by the next compaction; compact or hand off first |
 
 Each row is a test in [`hooks/register.test.ts`](hooks/register.test.ts), run against the engine itself. From a clone:

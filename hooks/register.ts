@@ -35,6 +35,8 @@ const REQUEST_CHARS = 6000;
 const LANGUAGE_MESSAGES = 5;
 const BACKGROUND_TASKS = 10;
 const BACKGROUND_TASK_CHARS = 160;
+// A background output file untouched this long with no completion notice has most likely finished.
+const BACKGROUND_IDLE_MS = 60_000;
 
 const SYSTEM =
   "You prepare the hand-over for a long coding-agent conversation that is about to be compacted. " +
@@ -54,7 +56,9 @@ const HANDOFF_INSTRUCTION =
   "(keep the headings in English):\n" +
   "## Goal and repo — the session's goal in one line, repositories and paths, branch\n" +
   "## Done — `- ✅ <what> — <sha | PR | path>`; with no artefact in the transcript the line is `- ⚠️ unconfirmed: <what>`\n" +
-  "## In flight — `- ⏳ <what> — pid <n> · done when <condition> · resume: <command>`; or `none`\n" +
+  "## In flight — `- ⏳ <what> — <pid n | task <id> | run <wf_id>> · done when <condition> · resume: <command>`; " +
+  "the id slot is the process id, background task id or workflow run id the transcript gives; when it gives none, " +
+  "omit the slot rather than write that it is missing; or `none`\n" +
   "## Open work in project trees — if the project state block names peel/breaker/improve open items, quote their ids and one-line what each one is, verbatim from that block; or `none`\n" +
   "## Plan — every part of the user's standing request, in order, one line each: `- ✅|⏳|⬜ <part> — <evidence, command or path>`; " +
   "a part is listed even when it is far ahead or was only implied by the request; never fewer lines than the request has parts\n" +
@@ -278,37 +282,84 @@ function projectStateSection(block) {
     "```\n" + block + "\n```";
 }
 
+// The task notification that closes a background task, in a message after the one that started it.
+function notice(messages, i, id) {
+  if (!id) return undefined;
+  return messages.slice(i + 1).map(x => x.text || "").find(t => t.includes(`<task-id>${id}</task-id>`));
+}
+
+// A Workflow started in the background answers with its names: "Task ID: …", "Transcript dir:
+// …/<session>/subagents/workflows/wf_…" and "Script file: …-wf_….js". The run writes its terminal record to
+// <session>/workflows/wf_….json only when it ends. A field the launch result does not carry stays empty.
+function workflowRun(u) {
+  const text = String(u.text || "");
+  const field = name => ((text.match(new RegExp(`${name}: (\\S+)`)) || [])[1] || "");
+  const dir = field("Transcript dir").replace(/\/$/, "");
+  const script = field("Script file");
+  const runId = (dir.match(/\/(wf_[\w-]+)$/) || script.match(/-(wf_[\w-]+)\.js$/) || [])[1] || "";
+  const terminal = /\/subagents\/workflows\/wf_[\w-]+$/.test(dir)
+    ? dir.replace(/\/subagents\/workflows\/(wf_[\w-]+)$/, "/workflows/$1.json") : "";
+  const summary = oneLine(((text.match(/Summary: ([^\n]+)/) || [])[1] || "").split(" · ")[0]);
+  return { taskId: field("Task ID"), runId, dir, script, terminal, summary };
+}
+
 // Subagents the main loop started that were still running at compaction. The
 // calls that would carry their results are summarised away, so the next turn
 // gets their prompts verbatim, from the transcript, not from the small model.
+// Workflow runs started in the background count as running until a task notification names their task id
+// or their terminal record exists; they carry `workflow` with the run's ids.
 async function inFlight($, messages) {
   const calls = [];
-  for (const m of messages) {
+  const runs = [];
+  messages.forEach((m, i) => {
     for (const u of m.toolUses || []) {
       if ((u.tool === "Agent" || u.tool === "Task") && u.input) calls.push(u);
+      else if (u.tool === "Workflow" && /Task ID:|Transcript dir:|launched in background/.test(String(u.text || ""))) runs.push({ u, i });
     }
+  });
+  const workflows = [];
+  for (const { u, i } of runs) {
+    const wf = workflowRun(u);
+    if (notice(messages, i, wf.taskId)) continue;
+    if (wf.terminal && await fsExists($, wf.terminal)) continue;
+    workflows.push({ ...u, workflow: wf });
   }
-  if (!calls.length) return [];
+  if (!calls.length) return workflows;
   let running = null;
   try {
     running = new Set((await $.agent.list()).filter(a => a.status === "running").map(a => a.id));
   } catch (_) {
     // No listing: a call still waiting for its answer is the best evidence left.
   }
-  return calls.filter(u => running ? Boolean(u.agentId && running.has(u.agentId)) : !u.result && !u.text);
+  return [...calls.filter(u => running ? Boolean(u.agentId && running.has(u.agentId)) : !u.result && !u.text), ...workflows];
+}
+
+function agentEntry(u) {
+  const x = u.input;
+  const meta = [x.subagent_type, x.model, u.agentId && `id ${u.agentId}`].filter(Boolean).join(" · ");
+  return `${x.description || "agent"}${meta ? " · " + meta : ""}\n` + fence(clip(String(x.prompt || ""), AGENT_PROMPT_CHARS));
+}
+
+function workflowEntry(u) {
+  const w = u.workflow;
+  const what = w.summary || (u.input && u.input.description) || "run";
+  const resume = w.script && w.runId
+    ? "`Workflow {scriptPath: \"" + w.script + "\", resumeFromRunId: \"" + w.runId + "\"}`" : "id unknown";
+  return `Workflow ${clip(what, BACKGROUND_TASK_CHARS)} · task ${w.taskId || "id unknown"} · run ${w.runId || "id unknown"}\n` +
+    `- journal: ${w.dir ? w.dir + "/journal.jsonl" : "id unknown"}; ended when ${w.terminal || "its terminal record"} exists or its task notification arrives\n` +
+    `- resume only if it stopped: ${resume}`;
 }
 
 function agentsSection(calls) {
   if (!calls.length) return "";
+  const agents = calls.filter(u => !u.workflow);
+  const runs = calls.filter(u => u.workflow);
   return "## Subagents running at compaction\n" +
-    "Their results may never reach this conversation. Check what they already wrote to disk, " +
-    "then relaunch the unfinished ones with these prompts; do not wait for them.\n\n" +
-    calls.map((u, i) => {
-      const x = u.input;
-      const meta = [x.subagent_type, x.model, u.agentId && `id ${u.agentId}`].filter(Boolean).join(" · ");
-      return `### ${i + 1}. ${x.description || "agent"}${meta ? " · " + meta : ""}\n` +
-        fence(clip(String(x.prompt || ""), AGENT_PROMPT_CHARS));
-    }).join("\n\n");
+    (agents.length ? "Their results may never reach this conversation. Check what they already wrote to disk, " +
+      "then relaunch the unfinished ones with these prompts; do not wait for them.\n" : "") +
+    (runs.length ? "Workflow runs keep running in the background and report back with a task notification: do not relaunch them. " +
+      "A journal untouched for a long time means the run may have stopped; resume only then.\n" : "") +
+    "\n" + [...agents.map(agentEntry), ...runs.map(workflowEntry)].map((s, i) => `### ${i + 1}. ${s}`).join("\n\n");
 }
 
 // Long texts keep their beginning and their end: the question at the end of a message is what a resume needs.
@@ -424,8 +475,10 @@ function tagText(text, tag) {
 }
 
 // Bash calls started with run_in_background: the task id and output file the tool returned. A task
-// notification later in the conversation closes a task; without one it may still run, or be lost.
-function backgroundTasks(messages) {
+// notification later in the conversation closes a task; without one it may still run, or be lost. The notice
+// can arrive after the messages the hook sees, so an output file that is non-empty and untouched for
+// BACKGROUND_IDLE_MS is reported as idle: the task most likely finished and its output is the result.
+async function backgroundTasks($, messages) {
   const tasks = [];
   messages.forEach((m, i) => {
     for (const u of m.toolUses || []) {
@@ -435,23 +488,36 @@ function backgroundTasks(messages) {
       if (!id) continue;
       const output = ((text.match(/written to: (\S+)/) || [])[1] || "").replace(/\.$/, "");
       const what = clip(oneLine(redact(String(u.input.description || u.input.command || ""))), BACKGROUND_TASK_CHARS);
-      const note = messages.slice(i + 1).map(x => x.text || "").find(t => t.includes(`<task-id>${id}</task-id>`));
+      const note = notice(messages, i, id);
       const state = note ? oneLine(redact(tagText(note, "summary") || tagText(note, "status") || "finished")) : "";
-      tasks.push({ id, output, what, state });
+      tasks.push({ id, output, what, state, idle: 0 });
     }
   });
-  return tasks;
+  const recent = tasks.slice(-BACKGROUND_TASKS);
+  if (!recent.some(t => !t.state && t.output)) return recent;
+  let now = 0;
+  try { now = Number(await $.clock.now()) || 0; } catch (_) { now = 0; }
+  for (const t of recent) {
+    if (t.state || !t.output) continue;
+    try {
+      const st = await $.fs.stat(t.output);
+      const idle = now - Number(st && st.mtimeMs);
+      if (st && st.size > 0 && idle > BACKGROUND_IDLE_MS) t.idle = Math.floor(idle / 60_000);
+    } catch (_) { /* no stat: reported without the idle hint */ }
+  }
+  return recent;
 }
 
-function backgroundSection(messages) {
-  const tasks = backgroundTasks(messages).slice(-BACKGROUND_TASKS);
+async function backgroundSection($, messages) {
+  const tasks = await backgroundTasks($, messages);
   if (!tasks.length) return "";
   return "## Background tasks at compaction\n" +
     "Bash calls started with run_in_background. ✅ = a completion notice came back; " +
-    "⏳ = none did, so it may still run or be lost: read its output file before relaunching it.\n" +
+    "⏳ = none did: an idle output most likely holds the finished result, read it; " +
+    "otherwise it may still run or be lost: read its output file before relaunching it.\n" +
     tasks.map(t => t.state
       ? `- ✅ ${t.id} · ${t.what} · ${t.state} · output ${t.output}`
-      : `- ⏳ ${t.id} · ${t.what} · no completion notice · output ${t.output}`).join("\n");
+      : `- ⏳ ${t.id} · ${t.what} · ${t.idle ? `output idle ${t.idle}m, read it` : "no completion notice"} · output ${t.output}`).join("\n");
 }
 
 async function run($, argv) {
@@ -574,7 +640,7 @@ async function hostLabel($) {
   }
 }
 
-function pointer(path, censusCommand, agents, hasProjectState, hasTodos) {
+function pointer(path, censusCommand, agents, runs, hasProjectState, hasTodos) {
   const stateHint = hasProjectState
     ? " The card's \"Open work in project trees\" names peel/breaker/improve open items — " +
       "re-run each harness's `status` subcommand before touching those items."
@@ -593,7 +659,9 @@ function pointer(path, censusCommand, agents, hasProjectState, hasTodos) {
     stateHint +
     (agents ? ` ${agents} subagent(s) were running at compaction and may not report back: ` +
       "the card's \"Subagents running at compaction\" has their exact prompts; " +
-      "check their output on disk and relaunch what is unfinished instead of waiting." : "");
+      "check their output on disk and relaunch what is unfinished instead of waiting." : "") +
+    (runs ? ` ${runs} workflow run(s) were running at compaction: they keep running and report back with a task notification; ` +
+      "do not relaunch them. The card's \"Subagents running at compaction\" has their task and run ids and how to resume one that stopped." : "");
 }
 
 // The standing request re-issued after the summary, verbatim: the summary says how far it got, this says
@@ -651,7 +719,10 @@ export function register(on, options) {
       if (e.agentId) return await next(e);
       const transcript = render(e.messages);
       if (!transcript) return await next(e);
-      const agents = await inFlight($, e.messages);
+      const running = await inFlight($, e.messages);
+      // Workflow runs go on in the background past a compaction and report back; they are listed, not held for.
+      const agents = running.filter(u => !u.workflow);
+      const runs = running.length - agents.length;
       // Subagents still running are stopped by a compaction. An automatic one
       // is held back until they answer: the engine asks again before each
       // request. Bounded by the context's fill and by time, so a hold cannot
@@ -689,7 +760,7 @@ export function register(on, options) {
       if (!todos.length) todos = await diskTasks($, home);
       const todosBlock = todosSection(todos);
       const projectBlockSection = projectStateSection(projectBlock);
-      const running = agentsSection(agents);
+      const runningBlock = agentsSection(running);
       const r = await $.model.complete({
         model,
         system: SYSTEM,
@@ -718,9 +789,9 @@ export function register(on, options) {
         requestSection(request, e.messages),
         todosBlock,
         projectBlockSection,
-        running,
+        runningBlock,
         conversationSection(e.messages, request),
-        backgroundSection(e.messages),
+        await backgroundSection($, e.messages),
       ].filter(Boolean).join("\n\n");
       if (card) {
         try {
@@ -750,7 +821,7 @@ export function register(on, options) {
         }
         const res = await next(e);
         if (!handoffPath || !res.messages) return res;
-        return { ...res, messages: [...res.messages, ...reissue(request, e.messages), { role: "user", text: pointer(handoffPath, censusCommand, agents.length, Boolean(projectBlock), todos.length > 0), toolUses: [] }] };
+        return { ...res, messages: [...res.messages, ...reissue(request, e.messages), { role: "user", text: pointer(handoffPath, censusCommand, agents.length, runs, Boolean(projectBlock), todos.length > 0), toolUses: [] }] };
       }
       const u = r.usage;
       const hostTag = host ? ` [${host}]` : "";
@@ -764,7 +835,7 @@ export function register(on, options) {
         role: "user",
         text: "This session is being continued from a previous conversation that ran out of context. " +
           "The summary below covers the earlier portion of the conversation.\n\nSummary:\n" + body +
-          (handoffPath ? "\n\n" + pointer(handoffPath, censusCommand, agents.length, Boolean(projectBlock), todos.length > 0) : ""),
+          (handoffPath ? "\n\n" + pointer(handoffPath, censusCommand, agents.length, runs, Boolean(projectBlock), todos.length > 0) : ""),
         toolUses: [],
       };
       const kept = [summary, ...reissue(request, e.messages)];
