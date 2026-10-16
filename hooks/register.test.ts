@@ -685,3 +685,90 @@ test("a fresh or empty background output keeps the no-notice line", async ($, on
   await $.session.compact({ trigger: "auto", messages: BACKGROUND });
   expect(seen.writes[0].text).toContain("- ⏳ bg222bbb · Wait for the mirror · no completion notice · output");
 });
+
+// ---------------------------------------------------------------------------
+// Deterministic preamble: open requests, active crons, files written
+// ---------------------------------------------------------------------------
+
+const CROSS_SESSION_MESSAGES = [
+  { role: "user", text: "do the thing", toolUses: [] },
+  { role: "user", text: '<system-reminder><cross-session-message from="uds:/tmp/cc/1.sock" from-name="GOVERNOR">research teaminternet backup for quorum</cross-session-message></system-reminder>', toolUses: [] },
+  { role: "assistant", text: "Working on it.", toolUses: [] },
+];
+
+test("open cross-session requests appear in the card preamble", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  await $.session.compact({ trigger: "auto", messages: CROSS_SESSION_MESSAGES });
+  const card = seen.writes[0].text;
+  expect(card).toContain("## Open requests");
+  expect(card).toContain("from **GOVERNOR**");
+  expect(card).toContain("research teaminternet");
+});
+
+test("a cross-session request answered by SendMessage is not listed as open", async ($, on) => {
+  const messages = [
+    ...CROSS_SESSION_MESSAGES,
+    { role: "assistant", text: "Sending reply.", toolUses: [
+      { tool_use_id: "t1", tool: "SendMessage", input: { to: "GOVERNOR", message: "done" }, text: "sent" },
+    ] },
+  ];
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  await $.session.compact({ trigger: "auto", messages });
+  const card = seen.writes[0].text;
+  expect(card).not.toContain("## Open requests");
+});
+
+test("active crons without a CronDelete appear in the preamble", async ($, on) => {
+  const messages = [
+    { role: "user", text: "set up a cron", toolUses: [] },
+    { role: "assistant", text: "Done.", toolUses: [
+      { tool_use_id: "t1", tool: "CronCreate", input: { id: "daily-check", schedule: "0 8 * * *", prompt: "run tests" }, text: "created" },
+      { tool_use_id: "t2", tool: "CronCreate", input: { id: "hourly-ping", schedule: "0 * * * *", prompt: "ping server" }, text: "created" },
+    ] },
+    { role: "assistant", text: "Deleting hourly.", toolUses: [
+      { tool_use_id: "t3", tool: "CronDelete", input: { id: "hourly-ping" }, text: "deleted" },
+    ] },
+  ];
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  await $.session.compact({ trigger: "auto", messages });
+  const card = seen.writes[0].text;
+  expect(card).toContain("## Active crons");
+  expect(card).toContain("daily-check");
+  expect(card).not.toContain("hourly-ping");
+});
+
+test("files written by Write/Edit appear in the preamble", async ($, on) => {
+  const messages = [
+    { role: "user", text: "write the config", toolUses: [] },
+    { role: "assistant", text: "Writing.", toolUses: [
+      { tool_use_id: "t1", tool: "Write", input: { file_path: "/home/u/work/config.yaml" }, text: "written" },
+      { tool_use_id: "t2", tool: "Edit", input: { file_path: "/home/u/code/docs/ops/inbox/cto/status.md" }, text: "edited" },
+    ] },
+  ];
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  await $.session.compact({ trigger: "auto", messages });
+  const card = seen.writes[0].text;
+  expect(card).toContain("## Files written this session");
+  expect(card).toContain("/home/u/work/config.yaml");
+  expect(card).toContain("## Inbox files touched");
+  expect(card).toContain("/home/u/code/docs/ops/inbox/cto/status.md");
+});
+
+test("render keeps all user messages when the transcript exceeds MAX_CHARS", async ($, on) => {
+  const userMessages = Array.from({ length: 50 }, (_, i) => ({
+    role: "user", text: `User message number ${i}: this is important context that must survive compaction.`, toolUses: [],
+  }));
+  const bigTool = "x".repeat(10_000);
+  const assistantMessages = Array.from({ length: 50 }, (_, i) => ({
+    role: "assistant", text: `Step ${i} done.`, toolUses: [
+      { tool_use_id: `t${i}`, tool: "Bash", input: { command: bigTool }, text: bigTool },
+    ],
+  }));
+  const messages = userMessages.flatMap((u, i) => [u, assistantMessages[i]]);
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  await $.session.compact({ trigger: "auto", messages });
+  const prompt = seen.prompts[0];
+  for (let i = 0; i < 50; i++) {
+    expect(prompt).toContain(`User message number ${i}`);
+  }
+});

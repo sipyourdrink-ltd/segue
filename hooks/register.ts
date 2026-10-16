@@ -74,7 +74,7 @@ function clip(s, n) {
 }
 
 function render(messages) {
-  const out = [];
+  const entries = [];
   for (const m of messages) {
     const parts = [];
     if (m.text) parts.push(m.text);
@@ -87,14 +87,41 @@ function render(messages) {
     for (const r of m.toolResults || []) {
       parts.push(`[result${r.isError ? " error" : ""}] ${clip(r.text, TOOL_TEXT_CHARS)}`);
     }
-    if (parts.length) out.push(`${m.role.toUpperCase()}: ${parts.join("\n")}`);
+    if (parts.length) entries.push({ role: m.role, text: `${m.role.toUpperCase()}: ${parts.join("\n")}` });
   }
-  let text = out.join("\n\n");
-  if (text.length > MAX_CHARS) {
-    text = text.slice(0, HEAD_CHARS) + "\n\n[… middle of the conversation omitted …]\n\n" +
-      text.slice(text.length - (MAX_CHARS - HEAD_CHARS));
+  const flat = entries.map(e => e.text).join("\n\n");
+  if (flat.length <= MAX_CHARS) return flat;
+  // Over budget: keep every USER entry, trim assistant tool entries from the middle.
+  const userTotal = entries.filter(e => e.role === "user")
+    .reduce((s, e) => s + e.text.length + 2, 0);
+  const assistBudget = Math.max(0, MAX_CHARS - userTotal - 60);
+  const headTarget = Math.min(HEAD_CHARS, Math.floor(assistBudget / 3));
+  let headChars = 0, headEnd = -1;
+  for (let i = 0; i < entries.length; i++) {
+    if (entries[i].role === "user") continue;
+    if (headChars + entries[i].text.length + 2 > headTarget) break;
+    headChars += entries[i].text.length + 2;
+    headEnd = i;
   }
-  return text;
+  let tailChars = 0, tailStart = entries.length;
+  for (let i = entries.length - 1; i > headEnd; i--) {
+    if (entries[i].role === "user") continue;
+    if (tailChars + entries[i].text.length + 2 > assistBudget - headChars) break;
+    tailChars += entries[i].text.length + 2;
+    tailStart = i;
+  }
+  let omitted = false;
+  const result = [];
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    if (e.role === "user" || i <= headEnd || i >= tailStart) {
+      result.push(e.text);
+    } else if (!omitted) {
+      result.push("[… middle of the conversation omitted …]");
+      omitted = true;
+    }
+  }
+  return result.join("\n\n");
 }
 
 function block(text, tag) {
@@ -453,6 +480,94 @@ function userLanguage(messages) {
   return `${share >= 20 ? "ru" : "en"} (Cyrillic words ${share}% of the last user messages)`;
 }
 
+// ---------------------------------------------------------------------------
+// Deterministic preamble: extracted from the transcript, never from a model.
+// ---------------------------------------------------------------------------
+
+const CROSS_SESSION_RE = /<cross-session-message\s+from="([^"]*)"[^>]*from-name="([^"]*)"[^>]*>([\s\S]*?)<\/cross-session-message>/g;
+
+function openRequests(messages) {
+  const requests = [];
+  const answered = new Set();
+  for (const m of messages) {
+    if (m.role === "user" && m.text) {
+      for (const match of m.text.matchAll(CROSS_SESSION_RE)) {
+        requests.push({ from: match[2] || match[1], first400: clip(match[3].trim(), 400), ts: requests.length });
+      }
+    }
+    for (const u of m.toolUses || []) {
+      if (u.tool === "SendMessage" && u.input && u.input.to) answered.add(u.input.to);
+      if ((u.tool === "Write" || u.tool === "Edit") && u.input && typeof u.input.file_path === "string" &&
+        u.input.file_path.includes("/inbox/")) answered.add("inbox:" + u.input.file_path);
+    }
+  }
+  const open = requests.filter(r => !answered.has(r.from));
+  if (!open.length) return "";
+  return "## Open requests\nIncoming cross-session messages with no SendMessage reply or inbox file written back.\n\n" +
+    open.map(r => `- from **${r.from}**: ${r.first400}`).join("\n");
+}
+
+function lastOwnerMessages(messages, count) {
+  const owner = [];
+  for (let i = messages.length - 1; i >= 0 && owner.length < count; i--) {
+    const text = prose(messages[i]);
+    if (text) owner.unshift(clipMiddle(redact(text), 600));
+  }
+  if (!owner.length) return "";
+  return "## Last owner messages (verbatim)\n\n" +
+    owner.map((t, i) => `${i + 1}. ${t.replace(/\n/g, "\n   ")}`).join("\n");
+}
+
+function activeCrons(messages) {
+  const created = new Map();
+  const deleted = new Set();
+  for (const m of messages) {
+    for (const u of m.toolUses || []) {
+      if (u.tool === "CronCreate" && u.input) {
+        const id = u.input.id || u.input.name || (u.text && (u.text.match(/id[:\s]+(\S+)/i) || [])[1]) || "";
+        if (id) created.set(id, clip(String(u.input.schedule || u.input.prompt || ""), 120));
+      }
+      if (u.tool === "CronDelete" && u.input) {
+        const id = u.input.id || u.input.name || "";
+        if (id) deleted.add(id);
+      }
+    }
+  }
+  const active = [...created.entries()].filter(([id]) => !deleted.has(id));
+  if (!active.length) return "";
+  return "## Active crons\n\n" + active.map(([id, desc]) => `- ${id}: ${desc}`).join("\n");
+}
+
+function filesWritten(messages) {
+  const paths = new Set();
+  const inbox = new Set();
+  for (const m of messages) {
+    for (const u of m.toolUses || []) {
+      if ((u.tool === "Write" || u.tool === "Edit") && u.input && typeof u.input.file_path === "string") {
+        paths.add(u.input.file_path);
+        if (u.input.file_path.includes("/inbox/")) inbox.add(u.input.file_path);
+      }
+    }
+  }
+  const lines = [];
+  if (paths.size) {
+    lines.push("## Files written this session\n\n" + [...paths].map(p => `- ${p}`).join("\n"));
+  }
+  if (inbox.size) {
+    lines.push("## Inbox files touched\n\n" + [...inbox].map(p => `- ${p}`).join("\n"));
+  }
+  return lines.join("\n\n");
+}
+
+function deterministicPreamble(messages) {
+  const sections = [
+    openRequests(messages),
+    activeCrons(messages),
+    filesWritten(messages),
+  ].filter(Boolean);
+  return sections.join("\n\n");
+}
+
 // The conversation's tail as it was written: the resume point that the summary can blur.
 function conversationSection(messages, request) {
   const tail = tailMessages(messages, LAST_MESSAGES, request);
@@ -784,7 +899,9 @@ export function register(on, options) {
       // tasks are saved even when the small model wrote no card: they carry the in-flight work and the resume point
       // that the Haiku summary would have had to reconstruct.
       const modelWrote = written.length >= MIN_HANDOFF_CHARS;
+      const preamble = deterministicPreamble(e.messages);
       const card = [
+        preamble,
         modelWrote ? written : "",
         requestSection(request, e.messages),
         todosBlock,
