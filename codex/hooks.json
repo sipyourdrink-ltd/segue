@@ -1,0 +1,10 @@
+{
+  "description": "segue: handoff card before compaction, pointer after, hold while subagents run, guard on new subagents",
+  "hooks": {
+    "PreCompact": [{"hooks": [{"type": "command", "command": "node \"$PLUGIN_ROOT/codex/segue.mjs\" pre-compact", "timeout": 240}]}],
+    "PostCompact": [{"hooks": [{"type": "command", "command": "node \"$PLUGIN_ROOT/codex/segue.mjs\" post-compact", "timeout": 20}]}],
+    "SubagentStart": [{"hooks": [{"type": "command", "command": "node \"$PLUGIN_ROOT/codex/segue.mjs\" subagent-start", "timeout": 10}]}],
+    "SubagentStop": [{"hooks": [{"type": "command", "command": "node \"$PLUGIN_ROOT/codex/segue.mjs\" subagent-stop", "timeout": 10}]}],
+    "PreToolUse": [{"matcher": "spawn_agent|Agent", "hooks": [{"type": "command", "command": "node \"$PLUGIN_ROOT/codex/segue.mjs\" pre-tool-use", "timeout": 20}]}]
+  }
+}
