@@ -1,0 +1,19 @@
+{
+  "name": "rm-guard",
+  "version": "0.1.0",
+  "description": "Refuses a Bash command that runs rm with both recursive and force flags, including inside sudo, xargs, find -exec, sh -c, eval, command substitution and here-documents. The command text is parsed, never run.",
+  "author": {
+    "name": "Alex Chernysh",
+    "url": "https://github.com/sipyourdrink-ltd"
+  },
+  "homepage": "https://github.com/sipyourdrink-ltd/segue/tree/main/plugins/rm-guard",
+  "repository": "https://github.com/sipyourdrink-ltd/segue",
+  "license": "Apache-2.0",
+  "keywords": [
+    "claude-code",
+    "hooks",
+    "safety",
+    "bash",
+    "rm"
+  ]
+}

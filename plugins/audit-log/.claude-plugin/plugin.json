@@ -1,0 +1,19 @@
+{
+  "name": "audit-log",
+  "version": "0.1.0",
+  "description": "Appends one JSON line per finished tool call to a private daily file: time, session, directory, tool and input. Tool output is never written; file bodies become sizes; strings that look like credentials are masked.",
+  "author": {
+    "name": "Alex Chernysh",
+    "url": "https://github.com/sipyourdrink-ltd"
+  },
+  "homepage": "https://github.com/sipyourdrink-ltd/segue/tree/main/plugins/audit-log",
+  "repository": "https://github.com/sipyourdrink-ltd/segue",
+  "license": "Apache-2.0",
+  "keywords": [
+    "claude-code",
+    "hooks",
+    "audit",
+    "log",
+    "jsonl"
+  ]
+}

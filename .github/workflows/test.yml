@@ -20,6 +20,14 @@ jobs:
       - run: claude plugin validate .claude-plugin/plugin.json
       - run: claude plugin validate .claude-plugin/marketplace.json
       - run: claude plugin test .
+      - run: claude plugin validate plugins/rm-guard
+      - run: claude plugin validate plugins/audit-log
+  hooks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 plugins/rm-guard/tests/test_rm_guard.py
+      - run: python3 plugins/audit-log/tests/test_audit_log.py
   codex:
     runs-on: ubuntu-latest
     steps:

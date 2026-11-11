@@ -10,6 +10,16 @@
       "name": "segue",
       "source": "./",
       "description": "Compaction that continues without a break: a handoff card before /compact and auto-compact, the summary on Haiku, an instruction to carry on from the card; the same card under Codex CLI."
+    },
+    {
+      "name": "rm-guard",
+      "source": "./plugins/rm-guard",
+      "description": "Refuses rm with recursive and force flags in a Bash command, including inside wrappers, sh -c, eval and substitutions."
+    },
+    {
+      "name": "audit-log",
+      "source": "./plugins/audit-log",
+      "description": "One JSON line per finished tool call in a private daily file; no tool output, file bodies as sizes, credentials masked."
     }
   ]
 }

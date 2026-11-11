@@ -261,6 +261,13 @@ CI installs the latest Claude Code on every run, so a red badge means the interf
 
 Something off? [Open an issue](https://github.com/sipyourdrink-ltd/segue/issues) with the toast text or the `segue:` line from `claude --debug`.
 
+### also in this repository
+
+Two small plugins from the same marketplace. Each is one Python hook with no dependencies and installs on its own.
+
+- [`rm-guard`](plugins/rm-guard): refuses a Bash command that runs `rm` with recursive and force flags, including inside wrappers, `sh -c`, `eval` and substitutions. `claude plugin install rm-guard@sipyourdrink`
+- [`audit-log`](plugins/audit-log): one JSON line per finished tool call in a private daily file; no tool output, file bodies as sizes, credentials masked. `claude plugin install audit-log@sipyourdrink`
+
 ### why the name?
 
 *Segue* is a direction in a score: go on to the next section without a pause. It comes from the same house as [Bernstein](https://github.com/sipyourdrink-ltd/bernstein).
