@@ -1,6 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 230" width="820" height="230" role="img" aria-labelledby="t d">
   <title id="t">segue</title>
   <desc id="d">A long conversation runs into a double barline marked compact. A tie crosses the barline and a handoff card hangs from it; after the barline the conversation continues from the card, short.</desc>
+  <rect x="0.5" y="0.5" width="819" height="229" rx="12" fill="#FFFFFF" stroke="#D0D7DE"/>
   <g font-family="'Iowan Old Style','Palatino Linotype',Palatino,Georgia,serif" fill="#1F2328">
     <text x="24" y="128" font-size="84" font-style="italic" letter-spacing="-1">segue</text>
   </g>

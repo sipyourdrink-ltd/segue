@@ -1,15 +1,10 @@
 <div align="center">
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sipyourdrink-ltd/segue/main/assets/segue-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/sipyourdrink-ltd/segue/main/assets/segue-light.svg">
-  <img alt="segue: a long conversation runs into a compaction; a handoff card is written before it and read after it, and the conversation continues from the card" src="https://raw.githubusercontent.com/sipyourdrink-ltd/segue/main/assets/segue-light.svg" width="820">
-</picture>
+<img alt="segue: a long conversation runs into a compaction; a handoff card is written before it and read after it, and the conversation continues from the card" src="https://raw.githubusercontent.com/sipyourdrink-ltd/segue/main/assets/segue-dark.svg" width="820">
 
 ### Compaction that leaves a handoff card and continues from it — for Claude Code and Codex
 
 [![tests](https://github.com/sipyourdrink-ltd/segue/actions/workflows/test.yml/badge.svg)](https://github.com/sipyourdrink-ltd/segue/actions/workflows/test.yml)
-[![release](https://img.shields.io/github/v/release/sipyourdrink-ltd/segue)](https://github.com/sipyourdrink-ltd/segue/releases)
 [![License](https://img.shields.io/github/license/sipyourdrink-ltd/segue)](LICENSE)
 
 [install](#install) &middot; [uninstall](#uninstall) &middot; [Codex](#codex-cli-and-the-chatgpt-desktop-app) &middot; [what it costs](#what-it-costs) &middot; [what the agent reads](#what-the-agent-reads-afterwards) &middot; [options](#options) &middot; [limits](#limits)
