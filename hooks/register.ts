@@ -599,8 +599,9 @@ function number(v, fallback) {
 export function register(on, options) {
   const model = String((options && options.model) || "haiku");
   // The summary is a cheap call: low effort unless userConfig says otherwise.
-  const effortOption = String((options && options.effort) || "low");
-  const effort = EFFORTS.includes(effortOption) ? effortOption : "low";
+  // userConfig guarantees a string; only one of the five levels is passed on.
+  const effortOption = options && options.effort;
+  const effort = typeof effortOption === "string" && EFFORTS.includes(effortOption) ? effortOption : "low";
   const censusCommand = String((options && options.censusCommand) || "");
   const handoffDir = String((options && options.handoffDir) || "~/.claude/handoffs");
   const holdMs = number(options && options.holdForAgentsMinutes, 10) * 60_000;

@@ -183,7 +183,7 @@ A line under **Done** carries a ✅ only when the transcript holds the artefact 
 
 ### options
 
-Five, all optional. Set them with `/plugin configure segue@sipyourdrink`, or in your user `settings.json` (project settings are not read for plugin options):
+Six, all optional. Set them with `/plugin configure segue@sipyourdrink`, or in your user `settings.json` (project settings are not read for plugin options):
 
 ```json
 {
