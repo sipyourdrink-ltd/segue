@@ -13,6 +13,8 @@
 // The summary model's window is 200k tokens; ~2.5 chars per token for mixed text.
 const MAX_CHARS = 420_000;
 const HEAD_CHARS = 40_000;
+// The effort levels $.model.complete accepts; anything else falls back to low.
+const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 const TOOL_INPUT_CHARS = 500;
 const TOOL_TEXT_CHARS = 1500;
 const CENSUS_CHARS = 8000;
@@ -596,6 +598,9 @@ function number(v, fallback) {
 
 export function register(on, options) {
   const model = String((options && options.model) || "haiku");
+  // The summary is a cheap call: low effort unless userConfig says otherwise.
+  const effortOption = String((options && options.effort) || "low");
+  const effort = EFFORTS.includes(effortOption) ? effortOption : "low";
   const censusCommand = String((options && options.censusCommand) || "");
   const handoffDir = String((options && options.handoffDir) || "~/.claude/handoffs");
   const holdMs = number(options && options.holdForAgentsMinutes, 10) * 60_000;
@@ -662,6 +667,7 @@ export function register(on, options) {
       const runningBlock = agentsSection(running);
       const r = await $.model.complete({
         model,
+        effort,
         system: SYSTEM,
         prompt: `<transcript>\n${transcript}\n</transcript>\n\n` +
           (state ? `<census>\n${state}\n</census>\n\n` : "") +

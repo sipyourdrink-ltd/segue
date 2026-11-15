@@ -1,6 +1,6 @@
 {
   "name": "segue",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Compaction that continues without a break: writes a handoff card before /compact and auto-compact, summarises on Haiku, and tells the agent to carry on from the card. Falls back to the built-in summary on any failure.",
   "author": {
     "name": "Alex Chernysh",
@@ -23,6 +23,12 @@
       "title": "Summary model",
       "description": "Model that writes the summary and the handoff card. The session's own model is not changed.",
       "default": "haiku"
+    },
+    "effort": {
+      "type": "string",
+      "title": "Summary effort",
+      "description": "Effort of the summary call: low, medium, high, xhigh or max. Any other value means low.",
+      "default": "low"
     },
     "handoffDir": {
       "type": "string",

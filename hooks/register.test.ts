@@ -14,7 +14,7 @@ const answered = text => ({ isAnswered: true, text, usage: { input_tokens: 10, o
 // The world beneath the plugin: what the model answers, what the machine says.
 // A call on `$` is answered with { value }; an event (session.compact) with its result.
 function world(on, reply, { git = true, disk = true, now = () => 0 } = {}) {
-  const seen = { writes: [], prompts: [], runs: [], toasts: [] };
+  const seen = { writes: [], prompts: [], runs: [], toasts: [], requests: [] };
   const ran = (exitCode, stdout) => ({ value: { exitCode, stdout, stderr: "", isStdoutTruncated: false, isStderrTruncated: false } });
   on("env.get", async () => ({ value: "/home/u" }));
   on("session.id", async () => ({ value: "0123456789abcdef" }));
@@ -34,7 +34,7 @@ function world(on, reply, { git = true, disk = true, now = () => 0 } = {}) {
     seen.writes.push(e);
     return { value: undefined };
   });
-  on("model.complete", async (_$, e) => { seen.prompts.push(e.prompt); return { value: reply }; });
+  on("model.complete", async (_$, e) => { seen.prompts.push(e.prompt); seen.requests.push(e); return { value: reply }; });
   on("session.compact", async () => ({ messages: [{ role: "user", text: "built-in summary", toolUses: [] }] }));
   return seen;
 }
@@ -85,6 +85,28 @@ test("options: model, folder and census command are taken from userConfig",
     expect(seen.writes[0].path).toBe("/srv/cards/2026-10-04-161207-01234567.md");
     expect(seen.writes[0].text).toContain("written by sonnet");
     expect(r.messages[0].text).toContain("(run `make census`)");
+  });
+
+test("by default the summary is written by Haiku at low effort", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary><handoff>${CARD}</handoff>`));
+  await $.session.compact({ trigger: "auto", messages: MESSAGES });
+  expect(seen.requests.length).toBe(1);
+  expect(seen.requests[0].model).toBe("haiku");
+  expect(seen.requests[0].effort).toBe("low");
+});
+
+test("options: effort is taken from userConfig",
+  { options: { effort: "medium" } }, async ($, on) => {
+    const seen = world(on, answered(`<summary>${SUMMARY}</summary>`));
+    await $.session.compact({ trigger: "manual", messages: MESSAGES });
+    expect(seen.requests[0].effort).toBe("medium");
+  });
+
+test("options: an effort outside the five levels falls back to low",
+  { options: { effort: "turbo" } }, async ($, on) => {
+    const seen = world(on, answered(`<summary>${SUMMARY}</summary>`));
+    await $.session.compact({ trigger: "manual", messages: MESSAGES });
+    expect(seen.requests[0].effort).toBe("low");
   });
 
 test("a card that cannot be written leaves the summary without the pointer", async ($, on) => {
