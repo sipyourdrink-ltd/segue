@@ -183,7 +183,7 @@ A line under **Done** carries a ✅ only when the transcript holds the artefact 
 
 ### options
 
-Five, all optional. Set them with `/plugin configure segue@sipyourdrink`, or in your user `settings.json` (project settings are not read for plugin options):
+Six, all optional. Set them with `/plugin configure segue@sipyourdrink`, or in your user `settings.json` (project settings are not read for plugin options):
 
 ```json
 {
@@ -200,6 +200,7 @@ For a clone loaded with `--plugin-dir` or `CLAUDE_CODE_PLUGIN_DIRS` the key is `
 | option | default | what it does |
 |---|---|---|
 | `model` | `haiku` | the model that writes the summary and the card |
+| `effort` | `low` | effort of the summary call: `low`, `medium`, `high`, `xhigh` or `max`; any other value means `low` |
 | `handoffDir` | `~/.claude/handoffs` | where the cards go; one file per compaction, `<date>-<time>-<session>.md` |
 | `censusCommand` | empty | a shell command whose output is given to the model as the machine's state; empty means the built-in git census |
 | `holdForAgentsMinutes` | `10` | how long an automatic compaction is held back while subagents of the conversation are still running; `0` never holds |
