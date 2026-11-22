@@ -350,10 +350,10 @@ test("todos are still saved when the model's reply is unusable", async ($, on) =
 // A world where $.env.get returns distinct values per name and $.fs.exists is
 // stubbed by directory. Used to exercise the data-dir-gated writes.
 function worldWithEnv(on, reply, envMap, existsMap, extra = {}) {
-  const seen = { writes: [], reads: {}, toasts: [], logs: [] };
+  const seen = { writes: [], reads: {}, toasts: [], logs: [], modelCalls: 0 };
   const ran = (exitCode, stdout) => ({ value: { exitCode, stdout, stderr: "", isStdoutTruncated: false, isStderrTruncated: false } });
   on("env.get", async (_$, e) => ({ value: envMap[e.name] !== undefined ? envMap[e.name] : "" }));
-  on("session.id", async () => ({ value: "0123456789abcdef" }));
+  on("session.id", async () => ({ value: extra.sessionId || "0123456789abcdef" }));
   on("session.cwd", async () => ({ value: "/home/u/work" }));
   on("clock.now", async () => ({ value: 0 }));
   on("ui.log", async (_$, e) => { seen.logs.push(e.text); return { value: undefined }; });
@@ -375,7 +375,7 @@ function worldWithEnv(on, reply, envMap, existsMap, extra = {}) {
     seen.reads[e.path] = e.text;
     return { value: undefined };
   });
-  on("model.complete", async () => ({ value: reply }));
+  on("model.complete", async () => { seen.modelCalls += 1; return { value: reply }; });
   on("session.compact", async () => ({ messages: [{ role: "user", text: "built-in summary", toolUses: [] }] }));
   return seen;
 }
@@ -694,4 +694,153 @@ test("a fresh or empty background output keeps the no-notice line", async ($, on
   on("fs.stat", async () => ({ value: { kind: "file", size: 0, mtimeMs: NOW - 15 * 60_000, isLink: false } }));
   await $.session.compact({ trigger: "auto", messages: BACKGROUND });
   expect(seen.writes[0].text).toContain("- ⏳ bg222bbb · Wait for the mirror · no completion notice · output");
+});
+
+test("project pointer writes a session-scoped file alongside handoff-current.md", async ($, on) => {
+  const seen = worldWithEnv(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`),
+    { HOME: "/home/u" }, { "/home/u/work/.claude": true });
+  await $.session.compact({ trigger: "auto", messages: MESSAGES });
+  const sidPtr = seen.writes.find(w => w.path === "/home/u/work/.claude/handoff-01234567.md");
+  const curPtr = seen.writes.find(w => w.path === "/home/u/work/.claude/handoff-current.md");
+  expect(sidPtr).toBeDefined();
+  expect(curPtr).toBeDefined();
+  expect(sidPtr.text).toContain("- session: 0123456789abcdef");
+  expect(curPtr.text).toContain("- session: 0123456789abcdef");
+});
+
+test("disk task ledger prefers the current session UUID and ignores other sessions' UUID directories", async ($, on) => {
+  const OTHER_UUID = "11111111-2222-3333-4444-555555555555";
+  const seen = worldWithEnv(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`),
+    { HOME: "/home/u" }, { "/home/u/.claude/tasks": true },
+    {
+      fsList: async (_$, e) => {
+        if (e.path === "/home/u/.claude/tasks") return { value: [OTHER_UUID] };
+        if (e.path === `/home/u/.claude/tasks/${OTHER_UUID}`) return { value: ["t1.json"] };
+        return { value: [] };
+      },
+      fsRead: async () => ({ value: JSON.stringify({ content: "Other session secret task", status: "in_progress" }) }),
+    });
+  await $.session.compact({ trigger: "auto", messages: MESSAGES });
+  const card = seen.writes.find(w => w.path.endsWith("01234567.md"));
+  expect(card.text).not.toContain("Other session secret task");
+});
+
+test("disk task ledger reads the matching session UUID directory when present", async ($, on) => {
+  const OWN_UUID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const OTHER_UUID = "11111111-2222-3333-4444-555555555555";
+  const seen = worldWithEnv(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`),
+    { HOME: "/home/u" }, { "/home/u/.claude/tasks": true },
+    {
+      sessionId: OWN_UUID,
+      fsList: async (_$, e) => {
+        if (e.path === "/home/u/.claude/tasks") return { value: [OTHER_UUID, OWN_UUID] };
+        if (e.path === `/home/u/.claude/tasks/${OWN_UUID}`) return { value: ["t1.json"] };
+        return { value: [] };
+      },
+      fsRead: async (_$, e) => e.path.includes(OWN_UUID)
+        ? { value: JSON.stringify({ content: "Own session task", status: "in_progress" }) }
+        : { value: JSON.stringify({ content: "Other session task", status: "pending" }) },
+    });
+  await $.session.compact({ trigger: "auto", messages: MESSAGES });
+  const card = seen.writes.find(w => w.path.endsWith("aaaaaaaa.md"));
+  expect(card.text).toContain("Own session task");
+  expect(card.text).not.toContain("Other session task");
+});
+
+test("precompute skips project pointer updates and deduplicates repeated identical precompute calls", async ($, on) => {
+  const seen = worldWithEnv(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`),
+    { HOME: "/home/u" }, { "/home/u/work/.claude": true });
+  const r1 = await $.session.compact({ trigger: "precompute", messages: MESSAGES });
+  const r2 = await $.session.compact({ trigger: "precompute", messages: MESSAGES });
+  expect(seen.modelCalls).toBe(1);
+  expect(r2).toEqual(r1);
+  expect(seen.toasts.length).toBe(0);
+  expect(seen.writes.some(w => w.path.includes("handoff-current.md") || w.path.includes("handoff-01234567.md"))).toBe(false);
+});
+
+test("consecutive compaction unwraps a re-issued standing request without double-wrapping", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  const first = await $.session.compact({ trigger: "auto", messages: REQUEST_MESSAGES });
+  const secondMessages = [
+    ...first.messages,
+    { role: "assistant", text: "Continued working on the tests.", toolUses: [] },
+    { role: "user", text: "go on", toolUses: [] },
+    { role: "assistant", text: "Finished two more tests.", toolUses: [] },
+  ];
+  const second = await $.session.compact({ trigger: "auto", messages: secondMessages });
+  const reissued = second.messages[1].text;
+  expect(reissued).toContain(REQUEST);
+  expect(reissued.split("The user's standing request, verbatim as sent before the compaction.").length).toBe(2);
+  expect(reissued).not.toContain("This session is being continued");
+});
+
+test("a Hebrew conversation is recorded as he", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  await $.session.compact({ trigger: "auto", messages: [
+    { role: "user", text: "בדוק בבקשה את הקובץ ותתקן את הבעיה בקוד", toolUses: [] },
+    { role: "assistant", text: "בודק את hooks/register.ts", toolUses: [] },
+  ] });
+  expect(seen.writes[0].text).toContain("- user language: he");
+});
+
+test("recent engine messages with handles are preserved verbatim after the summary on tool-pair boundaries", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  const longWithHandles = [
+    { handle: "h0", role: "user", text: REQUEST, toolUses: [] },
+    { handle: "h1", role: "assistant", text: "Step 1", toolUses: [] },
+    { handle: "h2", role: "user", text: "next", toolUses: [] },
+    { handle: "h3", role: "assistant", text: "Step 2", toolUses: [] },
+    { handle: "h4", role: "user", text: "check file", toolUses: [] },
+    { handle: "h5", role: "assistant", text: "Reading", toolUses: [{ tool_use_id: "t1", tool: "Read", input: { file_path: "a.ts" } }] },
+    { handle: "h6", role: "user", text: "", toolUses: [], toolResults: [{ tool_use_id: "t1", text: "file body" }] },
+    { handle: "h7", role: "assistant", text: "Found the bug in a.ts", toolUses: [] },
+  ];
+  const r = await $.session.compact({ trigger: "auto", messages: longWithHandles });
+  expect(r.messages[0].text).toContain("most recent messages from before compaction, kept verbatim");
+  // Summary + reissued standing request + preserved tail (h4..h7, 4 messages, clean boundary).
+  expect(r.messages.length).toBe(6);
+  expect(r.messages[2]).toEqual(longWithHandles[4]);
+  expect(r.messages[5]).toEqual(longWithHandles[7]);
+  expect(seen.writes.length).toBe(1);
+});
+
+test("preserveTailMessages: 0 disables verbatim tail preservation", { options: { preserveTailMessages: 0 } }, async ($, on) => {
+  world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  const longWithHandles = [
+    { handle: "h0", role: "user", text: REQUEST, toolUses: [] },
+    { handle: "h1", role: "assistant", text: "Step 1", toolUses: [] },
+    { handle: "h2", role: "user", text: "next", toolUses: [] },
+    { handle: "h3", role: "assistant", text: "Step 2", toolUses: [] },
+    { handle: "h4", role: "user", text: "ok", toolUses: [] },
+    { handle: "h5", role: "assistant", text: "Done", toolUses: [] },
+  ];
+  const r = await $.session.compact({ trigger: "auto", messages: longWithHandles });
+  expect(r.messages.length).toBe(2);
+  expect(r.messages[0].text).not.toContain("kept verbatim");
+});
+
+test("falls back to ~/.claude/plugins/data/segue-sipyourdrink when CLAUDE_PLUGIN_DATA is unset and dir exists", async ($, on) => {
+  const seen = worldWithEnv(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`),
+    { HOME: "/home/u" }, { "/home/u/.claude/plugins/data/segue-sipyourdrink": true });
+  await $.session.compact({ trigger: "auto", messages: MESSAGES });
+  const paths = seen.writes.map(w => w.path);
+  expect(paths).toContain("/home/u/.claude/handoffs/2026-10-04-161207-01234567.summary.md");
+  expect(paths).toContain("/home/u/.claude/plugins/data/segue-sipyourdrink/cards.jsonl");
+});
+
+test("preserved tail never starts on an orphaned toolResults turn", { options: { preserveTailMessages: 2 } }, async ($, on) => {
+  world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  const msgs = [
+    { handle: "h0", role: "user", text: REQUEST, toolUses: [] },
+    { handle: "h1", role: "assistant", text: "Step 1", toolUses: [] },
+    { handle: "h2", role: "user", text: "check", toolUses: [] },
+    { handle: "h3", role: "assistant", text: "Reading", toolUses: [{ tool_use_id: "t1", tool: "Read", input: { file_path: "a.ts" } }] },
+    { handle: "h4", role: "user", text: "", toolUses: [], toolResults: [{ tool_use_id: "t1", text: "file body" }] },
+    { handle: "h5", role: "assistant", text: "Done", toolUses: [] },
+  ];
+  const r = await $.session.compact({ trigger: "auto", messages: msgs });
+  // Stepping back from h4 (toolResults) includes its matching h3 (assistant toolUses).
+  expect(r.messages[2]).toEqual(msgs[3]);
+  expect(r.messages[3]).toEqual(msgs[4]);
+  expect(r.messages[4]).toEqual(msgs[5]);
 });

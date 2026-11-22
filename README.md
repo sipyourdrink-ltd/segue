@@ -183,7 +183,7 @@ A line under **Done** carries a ✅ only when the transcript holds the artefact 
 
 ### options
 
-Six, all optional. Set them with `/plugin configure segue@sipyourdrink`, or in your user `settings.json` (project settings are not read for plugin options):
+Seven, all optional. Set them with `/plugin configure segue@sipyourdrink`, or in your user `settings.json` (project settings are not read for plugin options):
 
 ```json
 {
@@ -205,6 +205,7 @@ For a clone loaded with `--plugin-dir` or `CLAUDE_CODE_PLUGIN_DIRS` the key is `
 | `censusCommand` | empty | a shell command whose output is given to the model as the machine's state; empty means the built-in git census |
 | `holdForAgentsMinutes` | `10` | how long an automatic compaction is held back while subagents of the conversation are still running; `0` never holds |
 | `agentGuardPercent` | `90` | from this fill of the context a new subagent is refused until the conversation compacts or hands off; `0` turns the guard off |
+| `preserveTailMessages` | `4` | how many recent engine messages (with handles, up to 40k chars and aligned to tool-call boundaries) are kept verbatim after the summary; `0` turns tail preservation off |
 
 The built-in census is `git status --branch`, `git worktree list`, the last five commits and the stash list, read at the moment of compaction. It is what lets the card say "3 uncommitted files on `fix/rounding`" from the machine instead of from memory. Outside a git repository there is no census and the card rests on the transcript alone. With a `censusCommand`, the instruction after compaction tells the agent to run that same command when it checks the card.
 

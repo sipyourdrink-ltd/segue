@@ -109,8 +109,17 @@ workflow_runs() {
 
 runs=$(workflow_runs 2>/dev/null || true)
 
-ptr="$cwd/.claude/handoff-current.md"
-if [ -f "$ptr" ]; then
+sid8=$(printf '%s' "$sid" | tr -cd 'A-Za-z0-9_-' | cut -c1-8)
+ptr=""
+if [ -n "$sid8" ] && [ -f "$cwd/.claude/handoff-${sid8}.md" ]; then
+  ptr="$cwd/.claude/handoff-${sid8}.md"
+elif [ -f "$cwd/.claude/handoff-current.md" ]; then
+  ptr_sid=$(sed -n 's/^- session:[[:space:]]*\([^[:space:]]*\).*/\1/p' "$cwd/.claude/handoff-current.md" | head -1)
+  if [ -z "$ptr_sid" ] || [ -z "$sid" ] || [ "$ptr_sid" = "$sid" ]; then
+    ptr="$cwd/.claude/handoff-current.md"
+  fi
+fi
+if [ -n "$ptr" ]; then
   # A cross-reference, not a replay: the engine already has the summary.
   printf 'segue [%s]: continuing from a prior handoff.\n\n' "${source:-unknown}"
   sed -n '1,40p' "$ptr"

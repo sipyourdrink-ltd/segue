@@ -36,6 +36,15 @@ const BACKGROUND_TASKS = 10;
 const BACKGROUND_TASK_CHARS = 160;
 // A background output file untouched this long with no completion notice has most likely finished.
 const BACKGROUND_IDLE_MS = 60_000;
+// Recent engine messages (carrying handle) kept verbatim after the summary so tool calls survive compaction.
+const DEFAULT_PRESERVE_TAIL_MESSAGES = 4;
+const PRESERVE_TAIL_CHARS = 40_000;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SUMMARY_PREFIX = "This session is being continued from a previous conversation that ran out of context.";
+const POINTER_PREFIX = "Before this compaction a handoff card was written to ";
+const REISSUE_PREFIX =
+  "The user's standing request, verbatim as sent before the compaction. The summary above says how far it got; " +
+  "every part of it is still the task:\n\n";
 
 const SYSTEM =
   "You prepare the hand-over for a long coding-agent conversation that is about to be compacted. " +
@@ -132,22 +141,30 @@ function latestTodos(messages) {
 // the more durable source for the todos list. The in-process scan above runs
 // first (fast, same session); this probe fills in only when the transcript scan
 // found nothing and the disk ledger is readable.
-async function diskTasks($, home) {
+async function diskTasks($, home, sid) {
   if (!home) return [];
   try {
     const base = `${home}/.claude/tasks`;
     if (!(await fsExists($, base))) return [];
     const lists = await $.fs.list(base);
     if (!Array.isArray(lists) || !lists.length) return [];
-    // Pick the most recently modified list dir.
-    const stamped = await Promise.all(lists.map(async (name) => {
-      try {
-        const st = await $.fs.stat(`${base}/${name}`);
-        return { name, mtime: st && typeof st.mtimeMs === "number" ? st.mtimeMs : 0 };
-      } catch (_) { return { name, mtime: 0 }; }
-    }));
-    stamped.sort((a, b) => b.mtime - a.mtime);
-    const listDir = `${base}/${stamped[0].name}`;
+    let chosen = "";
+    if (sid && lists.includes(sid)) {
+      chosen = sid;
+    } else {
+      // Never steal another session's UUID-named task list when a session id is known.
+      const candidates = sid ? lists.filter(name => !UUID_RE.test(name)) : lists;
+      if (!candidates.length) return [];
+      const stamped = await Promise.all(candidates.map(async (name) => {
+        try {
+          const st = await $.fs.stat(`${base}/${name}`);
+          return { name, mtime: st && typeof st.mtimeMs === "number" ? st.mtimeMs : 0 };
+        } catch (_) { return { name, mtime: 0 }; }
+      }));
+      stamped.sort((a, b) => b.mtime - a.mtime);
+      chosen = stamped[0].name;
+    }
+    const listDir = `${base}/${chosen}`;
     const files = await $.fs.list(listDir);
     const tasks = [];
     for (const f of (Array.isArray(files) ? files : [])) {
@@ -312,7 +329,13 @@ const HOST_WRAPPERS = /<(task-notification|system-reminder|local-command-stdout|
 const HOST_PREAMBLE = /\[SYSTEM NOTIFICATION[^\]]*\][^\n]*(?:\n(?!\n)[^\n]*)*/g;
 function prose(m) {
   if (!m || m.role !== "user" || typeof m.text !== "string") return "";
-  return m.text.replace(HOST_WRAPPERS, " ").replace(HOST_PREAMBLE, " ").trim();
+  let text = m.text.replace(HOST_WRAPPERS, " ").replace(HOST_PREAMBLE, " ").trim();
+  if (!text) return "";
+  // Ignore segue's own injected summary and pointer turns, and unwrap any
+  // previously re-issued standing request so consecutive compactions never double-wrap it.
+  if (text.startsWith(SUMMARY_PREFIX) || text.startsWith(POINTER_PREFIX)) return "";
+  while (text.startsWith(REISSUE_PREFIX)) text = text.slice(REISSUE_PREFIX.length).trim();
+  return text;
 }
 
 // The user's standing request: their last message with at least REQUEST_MIN_WORDS words of prose, so that
@@ -351,16 +374,21 @@ function tailMessages(messages, perRole, request) {
   return picked;
 }
 
-// The person's language from the words of their last few messages, code and URLs left out. Cyrillic words
-// count as ru; below one word in five Cyrillic the text is reported as en.
+// The person's language from the words of their last few messages, code and URLs left out.
+// Cyrillic counts as ru, Hebrew as he; below one word in five for either reports en.
 const PROSE_SKIP = /```[\s\S]*?```|`[^`\n]*`|https?:\/\/\S+/g;
 function userLanguage(messages) {
   const recent = messages.map(prose).filter(Boolean).slice(-LANGUAGE_MESSAGES);
   const words = recent.map(t => t.replace(PROSE_SKIP, " ")).join(" ").split(/[^\p{L}]+/u).filter(Boolean);
   if (!words.length) return "unknown";
   const cyrillic = words.filter(w => /\p{Script=Cyrillic}/u.test(w)).length;
-  const share = Math.round((100 * cyrillic) / words.length);
-  return `${share >= 20 ? "ru" : "en"} (Cyrillic words ${share}% of the last user messages)`;
+  const hebrew = words.filter(w => /\p{Script=Hebrew}/u.test(w)).length;
+  const ruShare = Math.round((100 * cyrillic) / words.length);
+  const heShare = Math.round((100 * hebrew) / words.length);
+  if (heShare >= 20 && heShare > ruShare) {
+    return `he (Hebrew words ${heShare}% of the last user messages)`;
+  }
+  return `${ruShare >= 20 ? "ru" : "en"} (Cyrillic words ${ruShare}% of the last user messages)`;
 }
 
 // The conversation's tail as it was written: the resume point that the summary can blur.
@@ -520,19 +548,28 @@ async function appendCardIndex($, cardPath, e, dataDir) {
   } catch (_) { /* index is best-effort */ }
 }
 
-// A pointer file in the project tree outlives the compacted summary. When the
-// cwd is a repo and writable, writing a short pointer under .claude/ lets a
-// later session discover the last handoff without reading plugin data.
-async function writeProjectPointer($, cwd, cardPath) {
+// Pointer files in the project tree outlive the compacted summary. Writing a
+// session-scoped file (handoff-<sid8>.md) prevents concurrent sessions in the
+// same cwd from clobbering one another; handoff-current.md carries the session
+// id too so SessionStart skips it when another session resumes.
+async function writeProjectPointer($, cwd, cardPath, sid) {
   if (!cwd || !cardPath) return "";
   try {
     const dir = `${cwd}/.claude`;
     if (!(await fsExists($, dir))) return "";
-    const path = `${dir}/handoff-current.md`;
-    const body = `# Current handoff\n\nLast compaction wrote a card to:\n\n    ${cardPath}\n\n` +
+    const tag = String(sid || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 8);
+    const body = `# Current handoff\n\n` +
+      (sid ? `- session: ${sid}\n\n` : "") +
+      `Last compaction wrote a card to:\n\n    ${cardPath}\n\n` +
       `Read that file first. The card is a hypothesis; the machine is the truth.\n`;
-    await $.fs.write(path, body);
-    return path;
+    const curPath = `${dir}/handoff-current.md`;
+    await $.fs.write(curPath, body);
+    if (tag) {
+      const sidPath = `${dir}/handoff-${tag}.md`;
+      await $.fs.write(sidPath, body);
+      return sidPath;
+    }
+    return curPath;
   } catch (_) {
     return "";
   }
@@ -555,7 +592,7 @@ function pointer(path, censusCommand, agents, runs, hasTodos) {
     ? " The card's \"Task tracker at compaction\" is the authoritative todo list; " +
       "re-check each item's actual progress before marking it in a new TodoWrite."
     : "";
-  return "Before this compaction a handoff card was written to " + path + ". " +
+  return POINTER_PREFIX + path + ". " +
     "Continue the work from it: read that file first, check it against the actual state " +
     (censusCommand ? "(run `" + censusCommand + "`)" : "(git status, running processes)") +
     ", then carry on from its \"Next steps\". " +
@@ -569,14 +606,59 @@ function pointer(path, censusCommand, agents, runs, hasTodos) {
       "do not relaunch them. The card's \"Subagents running at compaction\" has their task and run ids and how to resume one that stopped." : "");
 }
 
+// Rough character footprint of one engine message for tail-preservation budgeting.
+function messageChars(m) {
+  let n = typeof m.text === "string" ? m.text.length : 0;
+  for (const u of m.toolUses || []) {
+    try { n += JSON.stringify(u.input || "").length; } catch (_) {}
+    if (typeof u.text === "string") n += u.text.length;
+  }
+  for (const r of m.toolResults || []) {
+    if (typeof r.text === "string") n += r.text.length;
+  }
+  return n;
+}
+
+// Keep the most recent engine messages (carrying handle) verbatim after the
+// summary so in-flight tool calls and replies survive compaction without
+// re-reading, while keeping toolUse/toolResult pairs unbroken.
+function preservedTail(messages, limit) {
+  if (!limit || messages.length < 4) return [];
+  const maxKeep = Math.min(limit, Math.floor(messages.length / 2));
+  let start = messages.length;
+  let chars = 0;
+  for (let i = messages.length - 1; i >= 0 && messages.length - i <= maxKeep; i--) {
+    const m = messages[i];
+    if (!m || m.handle === undefined) break;
+    const size = messageChars(m);
+    if (chars + size > PRESERVE_TAIL_CHARS) break;
+    chars += size;
+    start = i;
+  }
+  if (start >= messages.length) return [];
+  // Never start the preserved slice on an orphaned toolResults user turn.
+  while (start < messages.length && messages[start].role === "user" &&
+    messages[start].toolResults && messages[start].toolResults.length) {
+    const prev = start > 0 ? messages[start - 1] : null;
+    if (prev && prev.handle !== undefined && prev.role === "assistant" &&
+      prev.toolUses && prev.toolUses.length &&
+      chars + messageChars(prev) <= PRESERVE_TAIL_CHARS) {
+      chars += messageChars(prev);
+      start -= 1;
+      break;
+    }
+    start += 1;
+  }
+  return start < messages.length ? messages.slice(start) : [];
+}
+
 // The standing request re-issued after the summary, verbatim: the summary says how far it got, this says
-// what all of it was. The trailing message is kept by identity elsewhere, so it is not repeated here.
-function reissue(request, messages) {
-  if (!request || request.message === messages[messages.length - 1]) return [];
+// what all of it was. Messages already kept by identity elsewhere are not repeated here.
+function reissue(request, messages, preserved = []) {
+  if (!request || request.message === messages[messages.length - 1] || preserved.includes(request.message)) return [];
   return [{
     role: "user",
-    text: "The user's standing request, verbatim as sent before the compaction. The summary above says how far it got; " +
-      "every part of it is still the task:\n\n" + clipMiddle(request.text, REQUEST_CHARS),
+    text: REISSUE_PREFIX + clipMiddle(request.text, REQUEST_CHARS),
     toolUses: [],
   }];
 }
@@ -606,8 +688,12 @@ export function register(on, options) {
   const handoffDir = String((options && options.handoffDir) || "~/.claude/handoffs");
   const holdMs = number(options && options.holdForAgentsMinutes, 10) * 60_000;
   const guardPercent = number(options && options.agentGuardPercent, 90);
+  const preserveTailLimit = Math.floor(number(options && options.preserveTailMessages, DEFAULT_PRESERVE_TAIL_MESSAGES));
   // An automatic compaction being held back for running subagents: when the hold began.
   let hold = null;
+  // Last speculative precompute result keyed by transcript fingerprint, to avoid
+  // duplicate Haiku calls and duplicate cards when the engine precomputes twice.
+  let precomputed = null;
 
   // A subagent started this close to the limit would be stopped by the next
   // compaction before it answers. Refused with the way out, so the model
@@ -628,6 +714,12 @@ export function register(on, options) {
       if (e.agentId) return await next(e);
       const transcript = render(e.messages);
       if (!transcript) return await next(e);
+      const precomputeKey = `${e.messages.length}:${transcript.length}:${e.instructions || ""}:${transcript.slice(-512)}`;
+      if (e.trigger === "precompute" && precomputed && precomputed.key === precomputeKey) {
+        $.ui.log("segue: reusing precomputed summary");
+        return precomputed.result;
+      }
+      if (e.trigger !== "precompute") precomputed = null;
       const running = await inFlight($, e.messages);
       // Workflow runs go on in the background past a compaction and report back; they are listed, not held for.
       const agents = running.filter(u => !u.workflow);
@@ -660,10 +752,11 @@ export function register(on, options) {
       // is read only when the transcript scan found nothing, so a transcript
       // that still holds the latest TodoWrite is trusted first.
       const cwd = await (async () => { try { return await $.session.cwd(); } catch (_) { return ""; } })();
+      const sid = await (async () => { try { return await $.session.id(); } catch (_) { return ""; } })();
       const home = await (async () => { try { return await $.env.get("HOME"); } catch (_) { return ""; } })();
       const state = await census($, censusCommand);
       let todos = latestTodos(e.messages);
-      if (!todos.length) todos = await diskTasks($, home);
+      if (!todos.length) todos = await diskTasks($, home, sid);
       const todosBlock = todosSection(todos);
       const runningBlock = agentsSection(running);
       const r = await $.model.complete({
@@ -708,14 +801,20 @@ export function register(on, options) {
         }
       }
       // Persist the summary prose alongside the card and keep an index of all
-      // handoffs under the plugin's data dir. A pointer under cwd's `.claude/`
-      // lets a later session discover the last handoff without reading plugin
-      // data. All three are best-effort and each is gated on the relevant
-      // directory existing; a failure never fails the compaction.
-      const dataDir = await (async () => { try { return await $.env.get("CLAUDE_PLUGIN_DATA"); } catch (_) { return ""; } })();
+      // handoffs under the plugin's data dir. On hosts where CLAUDE_PLUGIN_DATA
+      // is unset (some desktop builds), fall back to the default plugin data dir
+      // only if it already exists on disk. Project pointer files are updated only
+      // on committed compactions, never on speculative precompute.
+      let dataDir = await (async () => { try { return await $.env.get("CLAUDE_PLUGIN_DATA"); } catch (_) { return ""; } })();
+      if (!dataDir && home) {
+        const candidate = `${home}/.claude/plugins/data/segue-sipyourdrink`;
+        if (await fsExists($, candidate)) dataDir = candidate;
+      }
       await saveSummary($, handoffPath, body, dataDir);
       await appendCardIndex($, handoffPath, e, dataDir);
-      await writeProjectPointer($, cwd, handoffPath);
+      if (e.trigger !== "precompute") {
+        await writeProjectPointer($, cwd, handoffPath, sid);
+      }
       const host = await hostLabel($);
       if (body.length < MIN_SUMMARY_CHARS) {
         const why = r.isAnswered ? "short reply" : r.reason;
@@ -735,20 +834,24 @@ export function register(on, options) {
         $.ui.toast((handoffPath ? `handoff card: ${handoffPath}` : "summary written, no handoff card") +
           (agents.length ? ` · ${agents.length} subagent(s) were running: prompts in the card` : ""));
       }
+      const preserved = preservedTail(e.messages, preserveTailLimit);
       const summary = {
         role: "user",
-        text: "This session is being continued from a previous conversation that ran out of context. " +
+        text: SUMMARY_PREFIX + " " +
           "The summary below covers the earlier portion of the conversation.\n\nSummary:\n" + body +
-          (handoffPath ? "\n\n" + pointer(handoffPath, censusCommand, agents.length, runs, todos.length > 0) : ""),
+          (handoffPath ? "\n\n" + pointer(handoffPath, censusCommand, agents.length, runs, todos.length > 0) : "") +
+          (preserved.length ? "\n\nThe messages after this summary are the most recent messages from before compaction, kept verbatim." : ""),
         toolUses: [],
       };
-      const kept = [summary, ...reissue(request, e.messages)];
+      const kept = [summary, ...reissue(request, e.messages, preserved), ...preserved];
       // A trailing plain prompt from the person stays verbatim, by identity.
       const last = e.messages[e.messages.length - 1];
-      if (last && last.role === "user" && last.text && !(last.toolResults && last.toolResults.length) && !(last.toolUses && last.toolUses.length)) {
+      if (last && !preserved.includes(last) && last.role === "user" && last.text && !(last.toolResults && last.toolResults.length) && !(last.toolUses && last.toolUses.length)) {
         kept.push(last);
       }
-      return { messages: kept };
+      const result = { messages: kept };
+      if (e.trigger === "precompute") precomputed = { key: precomputeKey, result };
+      return result;
     } catch (err) {
       $.ui.log(`segue: error, fallback to built-in: ${err}`);
       return await next(e);

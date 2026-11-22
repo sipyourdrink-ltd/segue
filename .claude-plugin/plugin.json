@@ -1,6 +1,6 @@
 {
   "name": "segue",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "Compaction that continues without a break: writes a handoff card before /compact and auto-compact, summarises on Haiku, and tells the agent to carry on from the card. Falls back to the built-in summary on any failure.",
   "author": {
     "name": "Alex Chernysh",
@@ -53,6 +53,12 @@
       "title": "Refuse new subagents from this context fill (%)",
       "description": "An Agent call from the conversation is refused at or above this percentage of the context, with a reason that says to compact or hand off first. 0: off.",
       "default": 90
+    },
+    "preserveTailMessages": {
+      "type": "number",
+      "title": "Recent messages kept verbatim after compaction",
+      "description": "Up to this many trailing engine messages (with tool calls/results intact, capped at 40k chars) are kept verbatim by handle after the summary. 0: off.",
+      "default": 4
     }
   }
 }
