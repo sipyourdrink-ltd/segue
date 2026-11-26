@@ -844,3 +844,95 @@ test("preserved tail never starts on an orphaned toolResults turn", { options: {
   expect(r.messages[3]).toEqual(msgs[4]);
   expect(r.messages[4]).toEqual(msgs[5]);
 });
+
+// A session resumed by the compaction keeps some messages verbatim after the summary. The card puts their
+// text last and the pointer names how many lines come before it.
+const LONG_REQUEST = REQUEST + " " + "Keep the public API as it is and note every renamed symbol in the changelog. ".repeat(3).trim();
+const readLimit = text => { const m = text.match(/Read only its first (\d+) lines \(Read with limit \1\)/); return m ? Number(m[1]) : 0; };
+
+test("a message kept after the summary moves to the card's closing section and the pointer stops before it", async ($, on) => {
+  const messages = [
+    { role: "user", text: LONG_REQUEST, toolUses: [] },
+    { role: "assistant", text: "Parser refactored; the tests for the error branch are next.", toolUses: [] },
+  ];
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  const r = await $.session.compact({ trigger: "auto", messages });
+  const card = seen.writes[0].text;
+  const lines = card.split("\n");
+  const n = readLimit(r.messages[0].text);
+  expect(n > 0).toBe(true);
+  // The re-issued request is in the context; the card holds it once, past the limit.
+  expect(r.messages[1].text).toContain(LONG_REQUEST);
+  expect(card.split(LONG_REQUEST).length).toBe(2);
+  expect(lines[n]).toBe("");
+  expect(lines[n + 1]).toBe("## Kept verbatim after compaction");
+  const head = lines.slice(0, n).join("\n");
+  expect(head).not.toContain(LONG_REQUEST);
+  // What the resumed session does not have stays inside the limit: the agent's message, the language, the stub.
+  expect(head).toContain("Parser refactored; the tests for the error branch are next.");
+  expect(head).toContain("- user language: en");
+  expect(head).toContain('### User (standing request)\nVerbatim under "Kept verbatim after compaction" at the end of this card.');
+  expect(head).toContain("## Next steps");
+});
+
+test("a short kept message stays where it is and the whole card is read", async ($, on) => {
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  const r = await $.session.compact({ trigger: "auto", messages: REQUEST_MESSAGES });
+  expect(readLimit(r.messages[0].text)).toBe(0);
+  expect(r.messages[0].text).toContain("read that file first");
+  expect(seen.writes[0].text).not.toContain("## Kept verbatim after compaction");
+  expect(seen.writes[0].text).toContain("### User (standing request)\n```text\n" + REQUEST);
+});
+
+test("with the built-in summary nothing is known to be kept: the card stays in one piece", async ($, on) => {
+  const messages = [
+    { role: "user", text: LONG_REQUEST, toolUses: [] },
+    { role: "assistant", text: "Parser refactored.", toolUses: [] },
+  ];
+  const seen = world(on, answered(`<summary>short</summary>\n<handoff>${CARD}</handoff>`));
+  const r = await $.session.compact({ trigger: "auto", messages });
+  const card = seen.writes[0].text;
+  expect(card).not.toContain("## Kept verbatim after compaction");
+  expect(card).toContain("### User (standing request)\n```text\n" + LONG_REQUEST);
+  expect(r.messages[0].text).toBe("built-in summary");
+  expect(readLimit(r.messages[r.messages.length - 1].text)).toBe(0);
+});
+
+test("a preserved agent message is not read twice, an older one stays inside the limit", async ($, on) => {
+  const reply = "The bug is in a.ts: the tokenizer drops the last token when the input ends without a newline. ".repeat(3).trim();
+  const messages = [
+    { handle: "h0", role: "user", text: REQUEST, toolUses: [] },
+    { handle: "h1", role: "assistant", text: "Step 1 is done and committed.", toolUses: [] },
+    { handle: "h2", role: "user", text: "next", toolUses: [] },
+    { handle: "h3", role: "assistant", text: "Step 2 is done and committed.", toolUses: [] },
+    { handle: "h4", role: "user", text: "check file", toolUses: [] },
+    { handle: "h5", role: "assistant", text: "Reading", toolUses: [{ tool_use_id: "t1", tool: "Read", input: { file_path: "a.ts" } }] },
+    { handle: "h6", role: "user", text: "", toolUses: [], toolResults: [{ tool_use_id: "t1", text: "file body" }] },
+    { handle: "h7", role: "assistant", text: reply, toolUses: [] },
+  ];
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  const r = await $.session.compact({ trigger: "auto", messages });
+  const card = seen.writes[0].text;
+  const n = readLimit(r.messages[0].text);
+  expect(n > 0).toBe(true);
+  expect(r.messages[r.messages.length - 1].text).toBe(reply);
+  const head = card.split("\n").slice(0, n).join("\n");
+  expect(head).not.toContain(reply);
+  expect(head).toContain("Step 2 is done and committed.");
+  expect(card.split(reply).length).toBe(2);
+});
+
+test("a long request older than the tail closes the card and is skipped on resume", async ($, on) => {
+  const filler = Array.from({ length: 4 }, (_, i) => [
+    { role: "user", text: `ok ${i}`, toolUses: [] },
+    { role: "assistant", text: `step ${i} done`, toolUses: [] },
+  ]).flat();
+  const seen = world(on, answered(`<summary>${SUMMARY}</summary>\n<handoff>${CARD}</handoff>`));
+  const r = await $.session.compact({ trigger: "auto", messages: [{ role: "user", text: LONG_REQUEST, toolUses: [] }, ...filler] });
+  const lines = seen.writes[0].text.split("\n");
+  const n = readLimit(r.messages[0].text);
+  expect(n > 0).toBe(true);
+  expect(lines[n + 1]).toBe("## Standing request");
+  expect(lines.slice(0, n).join("\n")).toContain("step 3 done");
+  expect(r.messages.some(m => m.text.includes(LONG_REQUEST))).toBe(true);
+});
