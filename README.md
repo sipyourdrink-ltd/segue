@@ -137,6 +137,13 @@ user's standing request with its state: finish all open parts, not only the
 next one.
 ```
 
+When the card repeats messages that stay in the compacted context (the re-issued request, the preserved tail), their text is the card's closing section and the pointer adds a line limit, so the resumed session does not read them twice; a fresh session reads the whole card:
+
+```text
+Read only its first 74 lines (Read with limit 74): the rest of the file
+repeats messages that follow this summary verbatim.
+```
+
 And the card it points to looks like this (an illustrative example, not a recording):
 
 ```markdown

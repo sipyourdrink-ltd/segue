@@ -27,6 +27,10 @@ const MIN_HANDOFF_CHARS = 200;
 // The verbatim tail of the conversation in the card: the last messages of each side, the language, the background tasks.
 const LAST_MESSAGES = 3;
 const LAST_MESSAGE_CHARS = 3000;
+// A tail message that stays in the compacted context moves to the card's closing section only from this
+// length up: below it the stub line would cost as much as the text.
+const KEPT_MIN_CHARS = 200;
+const KEPT_HEADING = "## Kept verbatim after compaction";
 // The user's standing request: the last message of theirs with this many words of prose, kept verbatim
 // in the card and re-issued after the summary.
 const REQUEST_MIN_WORDS = 6;
@@ -369,7 +373,7 @@ function tailMessages(messages, perRole, request) {
     const text = m.role === "user" ? prose(m) : (m.text || "").trim();
     if (!text) continue;
     counts[m.role] += 1;
-    picked.unshift({ role: m.role, text, request: Boolean(request && request.message === m) });
+    picked.unshift({ role: m.role, text, message: m, request: Boolean(request && request.message === m) });
   }
   return picked;
 }
@@ -392,14 +396,31 @@ function userLanguage(messages) {
 }
 
 // The conversation's tail as it was written: the resume point that the summary can blur.
-function conversationSection(messages, request) {
+// `inContext` holds the messages the compacted session still has verbatim after the summary. Their text
+// goes to a closing section that a resumed session is told not to read, with a one-line stub in its place;
+// a fresh session reads the whole card and loses nothing. Without `inContext` everything stays in `main`.
+function conversationSection(messages, request, inContext) {
   const tail = tailMessages(messages, LAST_MESSAGES, request);
-  if (!tail.length) return "";
-  return "## Last messages at compaction\n" +
+  if (!tail.length) return { main: "", kept: "" };
+  const title = m => `### ${m.role === "user" ? (m.request ? "User (standing request)" : "User") : "Agent"}\n`;
+  const block = m => title(m) + fence(clipMiddle(redact(m.text), LAST_MESSAGE_CHARS));
+  const moved = m => Boolean(inContext && inContext.has(m.message) && m.text.length >= KEPT_MIN_CHARS);
+  const main = "## Last messages at compaction\n" +
     `- user language: ${userLanguage(messages)} — reply in the same language\n` +
     "Verbatim from the transcript, oldest first; the middle is cut when a message is long.\n\n" +
-    tail.map(m => `### ${m.role === "user" ? (m.request ? "User (standing request)" : "User") : "Agent"}\n` +
-      fence(clipMiddle(redact(m.text), LAST_MESSAGE_CHARS))).join("\n\n");
+    tail.map(m => moved(m) ? title(m) + `Verbatim under "${KEPT_HEADING.slice(3)}" at the end of this card.` : block(m)).join("\n\n");
+  const blocks = tail.filter(moved).map(block);
+  const kept = blocks.length
+    ? KEPT_HEADING + "\n" +
+      "These messages stay in the context of the session this compaction resumed, after its summary. " +
+      "A fresh session has only this copy.\n\n" + blocks.join("\n\n")
+    : "";
+  return { main, kept };
+}
+
+// A plain prompt from the person, the kind that stays after the summary by identity when it is the last message.
+function plainPrompt(m) {
+  return Boolean(m && m.role === "user" && m.text && !(m.toolResults && m.toolResults.length) && !(m.toolUses && m.toolUses.length));
 }
 
 // One line, for list items that must not break across lines.
@@ -494,7 +515,9 @@ async function stamp($) {
   return { day: iso.slice(0, 10), time: iso.slice(11, 19).replace(/:/g, ""), zone: "UTC" };
 }
 
-async function saveHandoff($, dir, source, e, card) {
+// `repeat` closes the card: the text a session resumed by this compaction already has. The returned `lines`
+// is how many lines come before it, 0 when there is nothing to skip.
+async function saveHandoff($, dir, source, e, main, repeat = "") {
   const { day, time, zone } = await stamp($);
   const id = await $.session.id();
   const path = `${dir}/${day}-${time}-${id.slice(0, 8)}.md`;
@@ -504,8 +527,8 @@ async function saveHandoff($, dir, source, e, card) {
     `- written by ${source}: a hypothesis, not the truth\n` +
     `- transcript: ~/.claude/projects/*/${id}.jsonl — the card is a digest; the last user turns there are the resume point\n` +
     `- resume: read this card → read the last user turns in the transcript → check both against the repository's actual state → carry on from "Next steps"\n\n`;
-  await $.fs.write(path, head + card + "\n");
-  return path;
+  await $.fs.write(path, head + [main, repeat].filter(Boolean).join("\n\n") + "\n");
+  return { path, lines: main && repeat ? (head + main).split("\n").length : 0 };
 }
 
 // The compacted summary itself is a durable artifact: readers of the card
@@ -587,7 +610,7 @@ async function hostLabel($) {
   }
 }
 
-function pointer(path, censusCommand, agents, runs, hasTodos) {
+function pointer(path, censusCommand, agents, runs, hasTodos, readLines = 0) {
   const todosHint = hasTodos
     ? " The card's \"Task tracker at compaction\" is the authoritative todo list; " +
       "re-check each item's actual progress before marking it in a new TodoWrite."
@@ -596,6 +619,8 @@ function pointer(path, censusCommand, agents, runs, hasTodos) {
     "Continue the work from it: read that file first, check it against the actual state " +
     (censusCommand ? "(run `" + censusCommand + "`)" : "(git status, running processes)") +
     ", then carry on from its \"Next steps\". " +
+    (readLines ? `Read only its first ${readLines} lines (Read with limit ${readLines}): ` +
+      "the rest of the file repeats messages that follow this summary verbatim. " : "") +
     "The card is a hypothesis; the machine is the truth. " +
     "Its \"Plan\" lists every part of the user's standing request with its state: finish all open parts, not only the next one." +
     todosHint +
@@ -782,20 +807,39 @@ export function register(on, options) {
       // tasks are saved even when the small model wrote no card: they carry the in-flight work and the resume point
       // that the Haiku summary would have had to reconstruct.
       const modelWrote = written.length >= MIN_HANDOFF_CHARS;
+      // What the compacted session keeps verbatim after segue's own summary: the preserved tail, a trailing
+      // plain prompt, and the standing request (re-issued unless one of those two already carries it). The card
+      // puts that text last so the resumed session can stop reading before it. With the built-in summary
+      // nothing is known to be kept, and the card stays in one piece.
+      const preserved = body.length < MIN_SUMMARY_CHARS ? [] : preservedTail(e.messages, preserveTailLimit);
+      const last = e.messages[e.messages.length - 1];
+      let inContext = null;
+      if (body.length >= MIN_SUMMARY_CHARS) {
+        inContext = new Set(preserved);
+        if (plainPrompt(last)) inContext.add(last);
+        if (request && request.message !== last) inContext.add(request.message);
+      }
+      const talk = conversationSection(e.messages, request, inContext);
+      const older = requestSection(request, e.messages);
+      const olderKept = Boolean(older && inContext && inContext.has(request.message));
       const card = [
         modelWrote ? written : "",
-        requestSection(request, e.messages),
+        olderKept ? "" : older,
         todosBlock,
         runningBlock,
-        conversationSection(e.messages, request),
+        talk.main,
         await backgroundSection($, e.messages),
       ].filter(Boolean).join("\n\n");
-      if (card) {
+      const repeat = [olderKept ? older : "", talk.kept].filter(Boolean).join("\n\n");
+      let readLines = 0;
+      if (card || repeat) {
         try {
           const dir = handoffDir.startsWith("~/") && home ? home + handoffDir.slice(1) : handoffDir;
           const source = modelWrote ? `${model} from the transcript and a census of the machine`
             : "segue (the model wrote no card) from the transcript";
-          handoffPath = await saveHandoff($, dir, source, e, card);
+          const saved = await saveHandoff($, dir, source, e, card || repeat, card ? repeat : "");
+          handoffPath = saved.path;
+          readLines = saved.lines;
         } catch (err) {
           $.ui.log(`segue: handoff not written: ${err}`);
         }
@@ -834,19 +878,17 @@ export function register(on, options) {
         $.ui.toast((handoffPath ? `handoff card: ${handoffPath}` : "summary written, no handoff card") +
           (agents.length ? ` · ${agents.length} subagent(s) were running: prompts in the card` : ""));
       }
-      const preserved = preservedTail(e.messages, preserveTailLimit);
       const summary = {
         role: "user",
         text: SUMMARY_PREFIX + " " +
           "The summary below covers the earlier portion of the conversation.\n\nSummary:\n" + body +
-          (handoffPath ? "\n\n" + pointer(handoffPath, censusCommand, agents.length, runs, todos.length > 0) : "") +
+          (handoffPath ? "\n\n" + pointer(handoffPath, censusCommand, agents.length, runs, todos.length > 0, readLines) : "") +
           (preserved.length ? "\n\nThe messages after this summary are the most recent messages from before compaction, kept verbatim." : ""),
         toolUses: [],
       };
       const kept = [summary, ...reissue(request, e.messages, preserved), ...preserved];
       // A trailing plain prompt from the person stays verbatim, by identity.
-      const last = e.messages[e.messages.length - 1];
-      if (last && !preserved.includes(last) && last.role === "user" && last.text && !(last.toolResults && last.toolResults.length) && !(last.toolUses && last.toolUses.length)) {
+      if (!preserved.includes(last) && plainPrompt(last)) {
         kept.push(last);
       }
       const result = { messages: kept };
